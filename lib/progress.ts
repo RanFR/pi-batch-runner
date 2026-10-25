@@ -36,13 +36,15 @@ export function saveProgress(state: BatchState): void {
 }
 
 /**
- * 批次终结：progress → .progress.done.json。
+ * 批次终结：progress → .progress.done.json（幂等：目标已存在时先删除，
+ * 避免 Windows 上 renameSync 目标存在时抛错残留 progress 文件）。
  * 返回 done 文件路径；源文件不存在时返回 null。
  */
 export function finishProgress(listFile: string): string | null {
 	const from = progressPathFor(listFile);
 	const to = `${from}.done`;
 	if (!fs.existsSync(from)) return null;
+	if (fs.existsSync(to)) fs.rmSync(to);
 	fs.renameSync(from, to);
 	return to;
 }

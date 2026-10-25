@@ -5,7 +5,7 @@
  * - 根会话 send 返回 void（对应 pi.sendUserMessage）；新会话/切换目标的 send 返回
  *   Promise 且在 settle 时 resolve（对应 ReplacedSessionContext.sendUserMessage）；
  * - 任务结果由 outcomes 队列驱动："ok" | "error" | "aborted" | "noshow"（发送后永远不 settle，
- *   用于发送失败看门狗）；
+ *   用于发送失败看门狗）| "silent"（运行正常发生但不经 bus 发布 settled，模拟事件桥断裂）；
  * - sleep 为真实 macrotask 让位 + 虚拟时钟推进，保证 settled 定时器有机会先执行。
  */
 
@@ -29,7 +29,7 @@ import type {
 // fake 基础设施
 // ============================================================================
 
-type Outcome = "ok" | "error" | "aborted" | "noshow" | "reject";
+type Outcome = "ok" | "error" | "aborted" | "noshow" | "reject" | "silent";
 
 interface SelectCall {
 	title: string;
@@ -82,6 +82,7 @@ interface Harness {
 	stop: StopHandle;
 	onSend?: (session: FakeSession, prompt: string) => void;
 	sendFailTimeoutMs: number;
+	sendFailVoidGraceMs?: number;
 	neverDrain?: boolean;
 	throwOnWait?: boolean;
 	switchFails?: boolean;
@@ -96,6 +97,7 @@ function makeHarness(opts?: {
 	onExhaust?: OnExhaust;
 	newSessionCancelled?: boolean;
 	sendFailTimeoutMs?: number;
+	sendFailVoidGraceMs?: number;
 	neverDrain?: boolean;
 	throwOnWait?: boolean;
 	switchFails?: boolean;
@@ -119,6 +121,7 @@ function makeHarness(opts?: {
 		vnow: 1_000_000,
 		stop: createStopHandle(),
 		sendFailTimeoutMs: opts?.sendFailTimeoutMs ?? 1500,
+		sendFailVoidGraceMs: opts?.sendFailVoidGraceMs,
 		neverDrain: opts?.neverDrain,
 		throwOnWait: opts?.throwOnWait,
 		switchFails: opts?.switchFails,
@@ -229,6 +232,23 @@ function makeHarness(opts?: {
 					// 发送被接受但运行永远不启动：保持 idle
 					return session.returnsPromise ? new Promise<void>(() => { }) : undefined;
 				}
+				if (outcome === "silent") {
+					// 运行正常发生（分支推进、idle 翻转、send promise resolve），
+					// 但不经 bus 发布 agent_settled（模拟 /reload 后事件桥断裂）
+					session.idle = false;
+					const p = new Promise<void>((resolve) => {
+						session.resolvers.push(() => resolve());
+					});
+					setTimeout(() => {
+						session.branch.push({
+							type: "message",
+							message: { role: "assistant", stopReason: "stop", errorMessage: undefined },
+						});
+						session.idle = true;
+						for (const r of session.resolvers.splice(0)) r();
+					}, 0);
+					return session.returnsPromise ? p : undefined;
+				}
 				if (outcome === "reject") {
 					// send promise 直接拒绝（对应 ReplacedSessionContext.sendUserMessage 失败路径）
 					return session.returnsPromise ? Promise.reject(new Error("send boom")) : undefined;
@@ -286,6 +306,7 @@ function makeDeps(h: Harness): EngineDeps {
 			await tick(); // 让位 macrotask，settle 定时器得以执行
 		},
 		sendFailTimeoutMs: h.sendFailTimeoutMs,
+		sendFailVoidGraceMs: h.sendFailVoidGraceMs,
 		onBatchEnd: () => {
 			h.batchEnded++;
 		},
@@ -617,12 +638,13 @@ describe("executor：中断（Esc）与停止", () => {
 });
 
 describe("executor：发送失败与排队消息", () => {
-	it("发送后始终空闲（无运行启动）→ 看门狗按失败处理", async () => {
+	it("发送后始终空闲（无运行启动）→ 看门狗按失败处理（void 发送，宽限期归零）", async () => {
 		const { harness: h, state } = makeHarness({
 			outcomes: ["noshow", "ok"],
 			retries: 0,
 			onExhaust: "skip",
 			sendFailTimeoutMs: 750,
+			sendFailVoidGraceMs: 0,
 		});
 		addTasks(state, [
 			["continue", "发不出去"],
@@ -634,6 +656,38 @@ describe("executor：发送失败与排队消息", () => {
 		expect(state.tasks[0]).toMatchObject({ status: "failed", attempts: 1 });
 		expect(state.tasks[0]!.error).toContain("未开始任何运行");
 		expect(state.tasks[1]!.status).toBe("ok");
+	});
+
+	it("void 发送看门狗含宽限期：错误文案按基础窗口+宽限期计时（容忍慢认证/弱网）", async () => {
+		const { harness: h, state } = makeHarness({
+			outcomes: ["noshow", "ok"],
+			retries: 0,
+			onExhaust: "skip",
+			sendFailTimeoutMs: 400,
+			sendFailVoidGraceMs: 600,
+		});
+		addTasks(state, [
+			["continue", "发不出去"],
+			["continue", "后续"],
+		]);
+
+		await run(h, state);
+
+		expect(state.tasks[0]).toMatchObject({ status: "failed" });
+		// 400ms 基础窗口 + 600ms 宽限 = 1000ms → 文案为 1s（若未加宽限则为 0s）
+		expect(state.tasks[0]!.error).toContain("1s 内未开始任何运行");
+		expect(state.tasks[0]!.error).not.toContain("事件桥");
+	});
+
+	it("运行已结束但未收到 settled（事件桥断裂）→ 按失败处理并提示事件桥/agent_settled", async () => {
+		const { harness: h, state } = makeHarness({ outcomes: ["silent"], retries: 0, onExhaust: "skip" });
+		addTasks(state, [["new", "桥断了"]]);
+
+		await run(h, state);
+
+		expect(state.tasks[0]).toMatchObject({ status: "failed" });
+		expect(state.tasks[0]!.error).toContain("agent_settled");
+		expect(state.tasks[0]!.error).toContain("事件桥");
 	});
 
 	it("发送前存在排队消息：先等待消化再发送", async () => {
@@ -815,6 +869,9 @@ describe("executor：发送异常", () => {
 		expect(state.tasks[0]).toMatchObject({ status: "failed", attempts: 1 });
 		expect(state.tasks[0]!.error).toContain("发送失败");
 		expect(state.tasks[0]!.error).toContain("send boom");
+		// 失败定案的任务也刷新落点会话：sessionFile 指向本次尝试所在的新会话，
+		// 而非发送前的旧值（report.md 会话列不缺席/不错挂）
+		expect(state.tasks[0]!.sessionFile).toBe(h.root.children[0]!.sessionFile);
 		expect(state.tasks[1]!.status).toBe("ok");
 	});
 });
@@ -863,6 +920,8 @@ describe("executor：降级与内部错误兜底", () => {
 		expect(fs.existsSync(path.join(tmp, "list.md.report.md"))).toBe(true);
 		expect(state.tasks[0]!.status).toBe("pending");
 		expect(state.tasks[0]!.error).toBe("批次提前结束");
+		// 重置回 pending 的任务未真正执行结束：不应携带 endedAt（report 语义噪声）
+		expect(state.tasks[0]!.endedAt).toBeUndefined();
 	});
 });
 

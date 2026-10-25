@@ -80,7 +80,7 @@ function savedTask(index: number, mode: "new" | "continue", status: string, extr
 	return { index, mode, title: `任务${index}`, prompt: `正文${index}`, status, attempts: 0, ...extra };
 }
 
-function writeProgress(world: { tmp: string }, tasks: unknown[]): void {
+function writeProgress(world: { tmp: string }, tasks: unknown[], extra?: Record<string, unknown>): void {
 	const state = {
 		schemaVersion: 1,
 		listFile: path.join(world.tmp, "list.md"),
@@ -90,6 +90,7 @@ function writeProgress(world: { tmp: string }, tasks: unknown[]): void {
 		retries: 3,
 		onExhaust: "pause",
 		tasks,
+		...(extra ?? {}),
 	};
 	fs.writeFileSync(progressPath(world), JSON.stringify(state, null, "\t"), "utf-8");
 }
@@ -296,6 +297,30 @@ describe("命令层：路由与无批次守卫", () => {
 		const widget = world.widgets.at(-1)!;
 		expect(widget?.[0]).toContain("── 批处理 · list ·");
 	});
+
+	it("status（cwd 多个 progress 文件）→ 取修改时间最新的，不依赖 readdir 顺序", async () => {
+		const { world, cmd, ctx } = await setup();
+		writeProgress(world, [savedTask(1, "new", "ok"), savedTask(2, "continue", "ok")]);
+		const other = {
+			schemaVersion: 1,
+			listFile: path.join(world.tmp, "other.md"),
+			batchTitle: "other",
+			startedAt: 1,
+			updatedAt: 1,
+			retries: 3,
+			onExhaust: "pause",
+			tasks: [savedTask(1, "new", "pending")],
+		};
+		fs.writeFileSync(path.join(world.tmp, "other.md.progress.json"), JSON.stringify(other), "utf-8");
+		// 显式设定 mtime：other 比 list 新 10s（消除写入顺序与时间分辨率的抖动）
+		const now = Date.now();
+		fs.utimesSync(path.join(world.tmp, "other.md.progress.json"), new Date(now), new Date(now));
+		fs.utimesSync(progressPath(world), new Date(now - 10_000), new Date(now - 10_000));
+
+		await cmd.handler("status", ctx);
+
+		expect(lastNotify(world).message).toContain("「other」");
+	});
 });
 
 // ============================================================================
@@ -317,6 +342,7 @@ describe("命令层：参数校验（零副作用）", () => {
 		["list.md --on-exhaust bang", "--on-exhaust 只支持 pause|skip|abort"],
 		["list.md extra.md", "多余参数"],
 		["nope.md", "清单文件不存在"],
+		["list.md --dry-run --start 5", "超出任务总数"],
 	];
 
 	for (const [args, expected] of cases) {
@@ -484,6 +510,19 @@ describe("命令层：tab 补全", () => {
 		expect(cmd.getArgumentCompletions!("zzz")).toBeNull();
 		spy.mockRestore();
 	});
+
+	it("含空格文件名：补全值加双引号（与 tokenizeArgs 引号语义一致）；已输入开引号时匹配并闭合", async () => {
+		const { world, cmd } = await setup();
+		fs.writeFileSync(path.join(world.tmp, "my tasks.md"), "x", "utf-8");
+		const spy = vi.spyOn(process, "cwd").mockReturnValue(world.tmp);
+
+		const items = cmd.getArgumentCompletions!("my") ?? [];
+		expect(items).toEqual([{ value: '"my tasks.md"', label: "my tasks.md" }]);
+
+		const quoted = cmd.getArgumentCompletions!('"my ta') ?? [];
+		expect(quoted.map((i) => i.value)).toEqual(['"my tasks.md"']);
+		spy.mockRestore();
+	});
 });
 
 // ============================================================================
@@ -643,6 +682,51 @@ describe("命令层：断点续跑", () => {
 		await cmd.handler("list.md", ctx);
 
 		expect(readDone(world).tasks[1]).toMatchObject({ status: "ok", attempts: 1 });
+	});
+
+	it("续跑时显式 --retries/--on-exhaust 覆盖上次配置并提示", async () => {
+		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
+		const prevSession = path.join(world.tmp, "prev.jsonl");
+		fs.writeFileSync(prevSession, "{}", "utf-8");
+		writeProgress(
+			world,
+			[savedTask(1, "new", "ok", { sessionFile: prevSession }), savedTask(2, "continue", "pending")],
+			{ retries: 5, onExhaust: "abort" },
+		);
+		await cmd.handler("list.md --retries 0 --on-exhaust skip", ctx);
+
+		expect(readDone(world).retries).toBe(0);
+		expect(readDone(world).onExhaust).toBe("skip");
+		expect(world.notifies.some((n) => n.message.includes("断点续跑") && n.message.includes("--retries=0"))).toBe(true);
+		expect(world.notifies.some((n) => n.message.includes("--on-exhaust=skip"))).toBe(true);
+	});
+
+	it("续跑未显式传配置项时沿用上次配置（不静默回退默认值、不提示）", async () => {
+		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
+		const prevSession = path.join(world.tmp, "prev.jsonl");
+		fs.writeFileSync(prevSession, "{}", "utf-8");
+		writeProgress(
+			world,
+			[savedTask(1, "new", "ok", { sessionFile: prevSession }), savedTask(2, "continue", "pending")],
+			{ retries: 5, onExhaust: "abort" },
+		);
+		await cmd.handler("list.md", ctx);
+
+		expect(readDone(world).retries).toBe(5);
+		expect(readDone(world).onExhaust).toBe("abort");
+		expect(world.notifies.some((n) => n.message.includes("断点续跑："))).toBe(false);
+	});
+
+	it("续跑时 --start 被忽略并提示（起点由断点决定）", async () => {
+		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
+		const prevSession = path.join(world.tmp, "prev.jsonl");
+		fs.writeFileSync(prevSession, "{}", "utf-8");
+		writeProgress(world, [savedTask(1, "new", "ok", { sessionFile: prevSession }), savedTask(2, "continue", "pending")]);
+		await cmd.handler("list.md --start 2", ctx);
+
+		expect(world.notifies.some((n) => n.message.includes("--start 已忽略"))).toBe(true);
+		// 仍从断点（任务 2）执行
+		expect(world.sent.map((s) => s.content)).toEqual(["正文二"]);
 	});
 });
 

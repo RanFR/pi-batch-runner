@@ -11,7 +11,9 @@
  * 3. 完成判定：先订阅 agent_settled（经注入的 SettledBus，订阅先于发送），发送后等待 settled；
  *    settled 后再 waitForIdle() 双保险（pi 内部 waitForIdle 在 agent_settled 派发完成后才 resolve，
  *    且 ReplacedSessionContext.sendUserMessage 的 Promise 也只在整轮 run 结束后 resolve，
- *    两条路径互为校验）。发送失败的看门狗：超时后仍 isIdle 且无 settled → 按失败处理。
+ *    两条路径互为校验）。发送失败的看门狗：超时后仍 isIdle 且无 settled → 按失败处理，
+ *    并根据会话分支是否推进区分「从未开始运行」与「运行已结束但未收到事件」（事件桥断裂）。
+ *    void 发送（根会话）无第二完成信号，另加宽限期容忍慢认证/弱网。
  * 4. 失败判定看分支上最后一条 assistant 消息的 stopReason（"error"/"aborted"），
  *    settled.aborted 表示用户 Esc。
  * 5. 批次状态以 progress 文件为唯一事实源；本模块不持有跨会话的模块级状态。
@@ -30,7 +32,9 @@ import {
 	type TaskRecord,
 } from "./types.ts";
 
-/** 批次停止控制（index.ts 的 activeBatch 持有；模块级丢失的最坏后果是防重入失效） */
+/** 批次停止控制（index.ts 的 activeBatch 持有）。/reload 会使模块级状态归零：
+ *  activeBatch 丢失仅致防重入与 stop 失效；settledListener 丢失则会让运行中批次
+ *  收不到完成事件而退化为看门狗失败循环（批处理期间禁止 /reload，见 index.ts 头部注释） */
 export interface StopHandle {
 	/** no = 正常运行；gentle = 当前任务自然结束后停止；now = 中止当前任务并停止 */
 	stopFlag: "no" | "gentle" | "now";
@@ -263,7 +267,9 @@ async function runTask(
 			record.attempts = 0;
 			record.startedAt = d.now();
 			record.endedAt = undefined;
-			record.sessionFile = leg.ctx.sessionManager.getSessionFile() ?? record.sessionFile;
+			// 直接赋值（不用 ?? 兜底）：全新会话首条消息落盘前 getSessionFile() 为 undefined，
+			// 保留旧值会把任务误归到上一任务的会话；undefined 更真实，成功后仍会刷新
+			record.sessionFile = leg.ctx.sessionManager.getSessionFile();
 			progress.saveProgress(state);
 		}
 		record.attempts++;
@@ -278,11 +284,13 @@ async function runTask(
 			}
 		});
 		debug(`runTask task=${record.index} outcome=${result.outcome}`);
+		// 无论成败都刷新落点会话（失败任务也要在报告中归到正确会话；发送失败等场景
+		// getSessionFile() 可能暂时为 undefined，此时保留原值）
+		record.sessionFile = leg.ctx.sessionManager.getSessionFile() ?? record.sessionFile;
 
 		if (result.outcome === "ok") {
 			record.status = "ok";
 			record.endedAt = d.now();
-			record.sessionFile = leg.ctx.sessionManager.getSessionFile() ?? record.sessionFile;
 			record.error = undefined;
 			progress.saveProgress(state);
 			leg.ctx.ui.setStatus("batch", report.statusText(state, d.now()));
@@ -392,6 +400,9 @@ async function attemptOnce(
 	});
 
 	// (2) 发送提示词（expandPromptTemplates: true，与手工输入行为一致）
+	// 先记录发送前的分支长度：看门狗触发时若分支已推进，说明运行发生过、
+	// 只是 agent_settled 事件未送达（事件桥断裂），与「从未开始运行」区分开
+	const branchLenBefore = leg.ctx.sessionManager.getBranch().length;
 	let sendPromise: Promise<void> | undefined;
 	try {
 		const ret: void | Promise<void> = leg.send(record.prompt, { expandPromptTemplates: true });
@@ -420,6 +431,10 @@ async function attemptOnce(
 	// (3) 等待 settled / 发送失败 / 看门狗
 	const startedAt = d.now();
 	const timeoutMs = d.sendFailTimeoutMs ?? 10_000;
+	// void 发送（根会话 pi.sendUserMessage 无返回 Promise）没有 sendP 第二信号，且 pi 的
+	// prompt() 在 _startRun 前有输入处理器与认证探测（网络）两个异步点：慢认证期间
+	// isIdle 恒为真，基础窗口内会误判 send-failed，故对 void 发送追加宽限期（默认合计 60s）
+	const effectiveTimeoutMs = sendP ? timeoutMs : timeoutMs + (d.sendFailVoidGraceMs ?? 50_000);
 	try {
 		for (; ;) {
 			const racers: Promise<"settled" | "send" | "tick">[] = [
@@ -446,10 +461,18 @@ async function attemptOnce(
 			}
 			// tick：刷新状态栏 + 发送失败看门狗
 			onTick();
-			if (!settledEvent && d.now() - startedAt > timeoutMs && leg.ctx.isIdle() && (!sendP || sendResolved)) {
+			if (!settledEvent && d.now() - startedAt > effectiveTimeoutMs && leg.ctx.isIdle() && (!sendP || sendResolved)) {
+				if (leg.ctx.sessionManager.getBranch().length > branchLenBefore) {
+					// 分支已推进：运行发生过，只是 settled 事件未送达（如 /reload 后事件桥断裂）
+					return {
+						outcome: "send-failed",
+						error:
+							"运行已结束但未收到 agent_settled 事件（疑似 /reload 或手工切换会话致事件桥断裂，请停止批次后重新启动）",
+					};
+				}
 				return {
 					outcome: "send-failed",
-					error: `发送后 ${Math.round(timeoutMs / 1000)}s 内未开始任何运行（请检查模型与认证配置）`,
+					error: `发送后 ${Math.round(effectiveTimeoutMs / 1000)}s 内未开始任何运行（请检查模型与认证配置）`,
 				};
 			}
 		}
@@ -501,11 +524,11 @@ export async function finalizeBatch(
 
 	const endedAt = d.now();
 
-	// 防御：不应有停留在 running 的任务
+	// 防御：不应有停留在 running 的任务（重置回 pending：未真正执行结束，不带 endedAt）
 	for (const t of state.tasks) {
 		if (t.status === "running") {
 			t.status = "pending";
-			t.endedAt = endedAt;
+			t.endedAt = undefined;
 			t.error = t.error ?? "批次提前结束";
 		}
 	}

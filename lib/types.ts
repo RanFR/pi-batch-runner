@@ -190,6 +190,10 @@ export interface EngineDeps {
 	sleep?: (ms: number) => Promise<void>;
 	/** 发送失败判定窗口（毫秒），默认 10_000；测试可调小 */
 	sendFailTimeoutMs?: number;
+	/** void 发送（根会话 pi.sendUserMessage 无返回 Promise，缺失第二完成信号）的
+	 *  看门狗加时窗口（毫秒），默认 50_000。pi 的 prompt() 在 _startRun 前有输入处理器
+	 *  与认证探测（网络）两个异步点，弱网/慢认证超过基础窗口时应放宽判定，避免误判。 */
+	sendFailVoidGraceMs?: number;
 	/** 终端响铃，默认 process.stdout.write("\x07") */
 	bell?: () => void;
 	/** 批次终结后的回调（index.ts 用来清理 activeBatch） */

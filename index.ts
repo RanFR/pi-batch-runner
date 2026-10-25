@@ -41,6 +41,11 @@ const USAGE = [
  *
  * 因此这里只允许存放「接线」性质的状态：事件监听槽位、防重入标志。
  * 批次数据一律以 progress 文件为唯一事实源（PLAN 陷阱 5）。
+ *
+ * ⚠ /reload 会以新代际重新求值本模块：settledListener / activeBatch 全部归零。
+ * 运行中批次的引擎闭包仍持有旧的 SettledBus（写入旧模块实例的槽位），而事件只会
+ * 派发给新实例注册的处理器 → 引擎永远收不到 agent_settled，看门狗逐任务误判
+ * send-failed，批次退化为失败循环。批处理期间禁止 /reload（README「运行中干预」）。
  */
 let settledListener: ((event: { aborted: boolean }) => void) | undefined;
 let activeBatch: ActiveBatch | null = null;
@@ -144,7 +149,12 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("batch", {
 		description: "批处理：顺序执行清单中的提示词任务（/batch <清单.md> [选项] | stop | status）",
 		getArgumentCompletions: (prefix) => {
-			const p = prefix.trim();
+			// 注：pi 1.4.0 的 getArgumentCompletions(prefix) 不提供会话上下文，
+			// 目录只能取 process.cwd()（会话 cwd 与扩展进程 cwd 不一致的极端场景下
+			// 补全源可能不符，属上游 API 限制）
+			const raw = prefix.trim();
+			const openedQuote = raw.startsWith('"');
+			const p = openedQuote ? raw.slice(1) : raw;
 			const items: { value: string; label: string; description?: string }[] = [];
 			if ("stop".startsWith(p)) items.push({ value: "stop", label: "stop", description: "停止当前批次" });
 			if ("status".startsWith(p)) items.push({ value: "status", label: "status", description: "查看批次进度" });
@@ -152,7 +162,11 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 				for (const entry of fs.readdirSync(process.cwd(), { withFileTypes: true })) {
 					if (!entry.isFile() || !/\.(md|txt)$/i.test(entry.name)) continue;
 					if (p && !entry.name.startsWith(p)) continue;
-					items.push({ value: entry.name, label: entry.name });
+					// pi 对命令参数补全按 value 原样插入（不自动加引号）：含空格的文件名
+					// 必须自带双引号，否则 tokenizeArgs 会拆成多个 token；用户已输入
+					// 开引号时同样闭合（与 pi 内建文件补全的 buildCompletionValue 语义一致）
+					const value = openedQuote || /\s/.test(entry.name) ? `"${entry.name}"` : entry.name;
+					items.push({ value, label: entry.name });
 				}
 			} catch {
 				// 目录不可读时只补全子命令
@@ -234,15 +248,26 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 	}
 
 	function findLatestProgress(ctx: ExtensionCommandContext): BatchState | null {
-		// 退化路径：activeBatch 丢失（如 /reload）后，尝试当前 cwd 下的 *.progress.json
+		// 退化路径：activeBatch 丢失（如 /reload）后，尝试当前 cwd 下的 *.progress.json。
+		// 多个候选时按修改时间取最新（并列时按文件名定序），避免依赖 readdir 顺序的不确定性。
 		try {
+			let best: { name: string; mtime: number; state: BatchState } | undefined;
 			for (const entry of fs.readdirSync(ctx.cwd)) {
 				if (!entry.endsWith(".progress.json")) continue;
 				const listFile = entry.slice(0, -".progress.json".length);
-				const abs = path.resolve(ctx.cwd, listFile);
-				const state = progress.loadProgress(abs);
-				if (state) return state;
+				const state = progress.loadProgress(path.resolve(ctx.cwd, listFile));
+				if (!state) continue;
+				let mtime = 0;
+				try {
+					mtime = fs.statSync(path.join(ctx.cwd, entry)).mtimeMs;
+				} catch {
+					// stat 失败按最旧处理，仍可作为候选
+				}
+				if (!best || mtime > best.mtime || (mtime === best.mtime && entry > best.name)) {
+					best = { name: entry, mtime, state };
+				}
 			}
+			return best?.state ?? null;
 		} catch {
 			// ignore
 		}
@@ -262,7 +287,7 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (activeBatch) {
-			ctx.ui.notify("已有批处理在运行：/batch status 查看进度，/batch stop [ --now ] 停止后再启动", "error");
+			ctx.ui.notify("已有批处理在运行：/batch status 查看进度，/batch stop [--now] 停止后再启动", "error");
 			return;
 		}
 		if (!ctx.isIdle()) {
@@ -270,8 +295,11 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// 参数解析
+		// 参数解析（explicit 标志用于断点续跑时的配置覆盖语义：显式传入才覆盖，见下方续跑分支）
 		const config = { retries: DEFAULT_RETRIES, onExhaust: DEFAULT_ON_EXHAUST, startAt: 1, dryRun: false };
+		let retriesExplicit = false;
+		let onExhaustExplicit = false;
+		let startExplicit = false;
 		let fileArg: string | undefined;
 		for (let k = 0; k < tokens.length; k++) {
 			const tok = tokens[k]!;
@@ -290,6 +318,7 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 						return;
 					}
 					config.startAt = n;
+					startExplicit = true;
 				} else if (tok === "--retries") {
 					const n = Number.parseInt(value, 10);
 					if (!Number.isInteger(n) || n < 0) {
@@ -297,12 +326,14 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 						return;
 					}
 					config.retries = n;
+					retriesExplicit = true;
 				} else {
 					if (value !== "pause" && value !== "skip" && value !== "abort") {
 						ctx.ui.notify(`--on-exhaust 只支持 pause|skip|abort，收到：${value}`, "error");
 						return;
 					}
 					config.onExhaust = value;
+					onExhaustExplicit = true;
 				}
 			} else if (tok.startsWith("--")) {
 				ctx.ui.notify(`未知选项：${tok}\n${USAGE}`, "error");
@@ -335,14 +366,15 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// dry-run：仅预览
-		if (config.dryRun) {
-			previewTasks(ctx, listFile, tasks, config.startAt);
+		// --start 越界校验：dry-run 预览同样需要报错（否则预览会展示全部任务，误导用户）
+		if (config.startAt > tasks.length) {
+			ctx.ui.notify(`--start ${config.startAt} 超出任务总数（${tasks.length}）`, "error");
 			return;
 		}
 
-		if (config.startAt > tasks.length) {
-			ctx.ui.notify(`--start ${config.startAt} 超出任务总数（${tasks.length}）`, "error");
+		// dry-run：仅预览
+		if (config.dryRun) {
+			previewTasks(ctx, listFile, tasks, config.startAt);
 			return;
 		}
 
@@ -364,6 +396,19 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 						ctx.ui.notify("清单任务数与断点进度不一致（清单可能已修改），请选择「从头重新开始」", "error");
 						return;
 					}
+					// 本次命令行显式传入的配置覆盖进度文件中的旧值；未传入的沿用（避免静默回退到默认值）。
+					// --start 在续跑时无意义（起点由断点决定），显式传入时明确提示被忽略。
+					const overrides: string[] = [];
+					if (retriesExplicit) {
+						saved.retries = config.retries;
+						overrides.push(`--retries=${config.retries} 已覆盖上次配置`);
+					}
+					if (onExhaustExplicit) {
+						saved.onExhaust = config.onExhaust;
+						overrides.push(`--on-exhaust=${config.onExhaust} 已覆盖上次配置`);
+					}
+					if (startExplicit) overrides.push("--start 已忽略（续跑起点由断点决定，从头重新开始时可用）");
+					if (overrides.length > 0) ctx.ui.notify(`断点续跑：${overrides.join("；")}`, "info");
 					const resumed = resumePlan(saved, firstOpen.index - 1);
 					if (!resumed) {
 						ctx.ui.notify("断点信息不完整，已取消。可重新执行 /batch 并选择「从头重新开始」", "error");
@@ -374,7 +419,8 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 						...saved,
 						tasks: saved.tasks.map((r, k) => ({
 							...r,
-							// 上次中断时停在 running 的任务重置为 pending（保持已尝试次数）
+							// 上次中断时停在 running 的任务重置为 pending；attempts 不在此处改动，
+							// runTask 对 pending 任务首次开始时会清零（测试已钉住该行为）
 							status: r.status === "running" ? ("pending" as const) : r.status,
 							mode: tasks[k]!.mode,
 							title: tasks[k]!.title,
