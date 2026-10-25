@@ -91,9 +91,11 @@ function adaptCtx(ctx: ExtensionCommandContext): BatchContext {
 			ctx.newSession({
 				// 新会话命名：经 setup 直写 sessionManager（会话替换后旧 pi 门面不可用）
 				...(opts.name
-					? { setup: async (sm: { appendSessionInfo: (name: string) => string }) => {
+					? {
+						setup: async (sm: { appendSessionInfo: (name: string) => string }) => {
 							sm.appendSessionInfo(opts.name!);
-						} }
+						}
+					}
 					: {}),
 				withSession: (fresh) => opts.withSession(adaptFreshLeg(fresh)),
 			}),

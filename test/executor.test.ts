@@ -216,7 +216,7 @@ function makeHarness(opts?: {
 				const outcome = harness.outcomes.length > 0 ? harness.outcomes.shift()! : "ok";
 				if (outcome === "noshow") {
 					// 发送被接受但运行永远不启动：保持 idle
-					return session.returnsPromise ? new Promise<void>(() => {}) : undefined;
+					return session.returnsPromise ? new Promise<void>(() => { }) : undefined;
 				}
 				session.idle = false;
 				const p = new Promise<void>((resolve) => {

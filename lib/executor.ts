@@ -253,7 +253,7 @@ async function runTask(
 	const record = state.tasks[i]!;
 	let lastStatusAt = 0;
 
-	for (;;) {
+	for (; ;) {
 		if (stop.stopFlag === "gentle") return "stop";
 		debug(`runTask task=${record.index} attempt=${record.attempts} stop=${stop.stopFlag}`);
 
@@ -381,7 +381,7 @@ async function attemptOnce(
 
 	// (1) 先订阅，再发送（防竞态：settled 必须在 send 之前挂上）
 	let settledEvent: { aborted: boolean } | undefined;
-	let resolveSettled: () => void = () => {};
+	let resolveSettled: () => void = () => { };
 	const settledP = new Promise<void>((resolve) => {
 		resolveSettled = resolve;
 	});
@@ -408,20 +408,20 @@ async function attemptOnce(
 	let sendError: unknown;
 	const sendP = sendPromise
 		? sendPromise.then(
-				() => {
-					sendResolved = true;
-				},
-				(e: unknown) => {
-					sendError = e;
-				},
-			)
+			() => {
+				sendResolved = true;
+			},
+			(e: unknown) => {
+				sendError = e;
+			},
+		)
 		: undefined;
 
 	// (3) 等待 settled / 发送失败 / 看门狗
 	const startedAt = d.now();
 	const timeoutMs = d.sendFailTimeoutMs ?? 10_000;
 	try {
-		for (;;) {
+		for (; ;) {
 			const racers: Promise<"settled" | "send" | "tick">[] = [
 				settledP.then(() => "settled" as const),
 				d.sleep(500).then(() => "tick" as const),

@@ -1,0 +1,31 @@
+{
+	// --- Editor ---
+	"editor.insertSpaces": false,
+	// --- Language Specific ---
+	"[typescript]": {
+		"editor.formatOnSave": true
+	},
+	"[javascript]": {
+		"editor.formatOnSave": true
+	},
+	// --- Files ---
+	"files.trimTrailingWhitespace": true,
+	"files.insertFinalNewline": true,
+	"files.exclude": {
+		"**/*.tsbuildinfo": true,
+		"**/.DS_Store": true
+	},
+	"files.readonlyInclude": {
+		"**/node_modules/**/*.*": true,
+		"**/package-lock.json": true
+	},
+	// --- Search ---
+	"search.exclude": {
+		"**/node_modules": true
+	},
+	// --- TypeScript ---
+	"js/ts.tsdk.path": "node_modules/typescript/lib",
+	"js/ts.preferences.quoteStyle": "single",
+	"js/ts.preferences.importModuleSpecifier": "relative",
+	"js/ts.tsc.autoDetect": "off"
+}
