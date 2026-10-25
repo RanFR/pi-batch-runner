@@ -246,12 +246,13 @@ function makeHarness(opts?: {
 	return { harness, state, tmp };
 }
 
-function addTasks(state: BatchState, defs: Array<[TaskMode, string]>): void {
-	for (const [mode, title] of defs) {
+function addTasks(state: BatchState, defs: Array<[TaskMode, string, string?]>): void {
+	for (const [mode, title, name] of defs) {
 		state.tasks.push({
 			index: state.tasks.length + 1,
 			mode,
 			title,
+			...(name !== undefined ? { name } : {}),
 			prompt: `prompt-${state.tasks.length + 1}-${title}`,
 			status: "pending",
 			attempts: 0,
@@ -333,8 +334,9 @@ describe("executor：顺序执行与推进", () => {
 		expect(child.newSessionCalls).toBe(1);
 		// 任务一在 child，任务二/三在 grandchild，任务四在 great-grandchild
 		expect(child.sends).toEqual(["prompt-1-任务一"]);
-		// 新会话经 setup 直写命名（name 选项透传）
-		expect(h.root.newSessionNames[0]).toBe("list · 任务1 任务一");
+		// 未指定 name：newSession 不带 name（不命名）；日志为裸 newSession
+		expect(h.root.newSessionNames[0]).toBeUndefined();
+		expect(h.log).toContain("newSession");
 		const grand = child.children[0]!;
 		expect(grand.sends).toEqual(["prompt-2-任务二", "prompt-3-任务三"]);
 		const great = grand.children[0]!;
@@ -343,6 +345,32 @@ describe("executor：顺序执行与推进", () => {
 		// 会话文件随 leg 记录
 		expect(state.tasks[0]!.sessionFile).toBe(child.sessionFile);
 		expect(state.tasks[2]!.sessionFile).toBe(grand.sessionFile);
+	});
+
+	it("「新会话」任务带显式 name 时精确透传给 newSession（不再拼接自动名）", async () => {
+		const { harness: h, state } = makeHarness({ outcomes: ["ok", "ok"] });
+		addTasks(state, [
+			["new", "任务一", "数据导入重构"],
+			["continue", "任务二"],
+		]);
+
+		await run(h, state);
+
+		expect(h.root.newSessionNames[0]).toBe("数据导入重构");
+		expect(h.log).toContain("newSession:数据导入重构");
+		// 自动命名模板（批次名 · 任务N 标题）不再出现
+		expect(h.log.every((l) => !l.includes(" · 任务"))).toBe(true);
+		expect(state.tasks.every((t) => t.status === "ok")).toBe(true);
+	});
+
+	it("断点续跑 fresh 起点同样透传显式 name", async () => {
+		const { harness: h, state } = makeHarness({ outcomes: ["ok"] });
+		addTasks(state, [["new", "恢复的任务", "恢复会话名"]]);
+
+		await run(h, state, { kind: "fresh", index: 0 });
+
+		expect(h.root.newSessionNames[0]).toBe("恢复会话名");
+		expect(state.tasks[0]!.status).toBe("ok");
 	});
 
 	it("首条任务为「继续」时在当前会话执行（不 newSession）", async () => {

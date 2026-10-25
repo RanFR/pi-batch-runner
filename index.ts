@@ -376,6 +376,7 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 							status: r.status === "running" ? ("pending" as const) : r.status,
 							mode: tasks[k]!.mode,
 							title: tasks[k]!.title,
+							name: tasks[k]!.name,
 							prompt: tasks[k]!.prompt,
 						})),
 					};
@@ -401,6 +402,7 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 					index: k + 1,
 					mode: t.mode,
 					title: t.title,
+					name: t.name,
 					prompt: t.prompt,
 					status: k + 1 < config.startAt ? "skipped" : "pending",
 					attempts: 0,
@@ -467,7 +469,8 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 		lines.push(`── 批处理预览 · ${path.basename(listFile)} · 共 ${tasks.length} 个任务${startAt > 1 ? ` · 从第 ${startAt} 条开始` : ""}`);
 		for (const t of tasks) {
 			const skipNote = t.index < startAt ? "（--start 跳过）" : "";
-			lines.push(`${statusIcon(t.mode)} ${String(t.index).padStart(2, " ")} ${t.title}${skipNote}`);
+			const nameNote = t.name ? ` · 会话名: ${t.name}` : "";
+			lines.push(`${statusIcon(t.mode)} ${String(t.index).padStart(2, " ")} ${t.title}${skipNote}${nameNote}`);
 		}
 		ctx.ui.setWidget("batch-summary", lines);
 		ctx.ui.notify(`预览模式：共 ${tasks.length} 个任务，未执行。去掉 --dry-run 以运行。`, "info");

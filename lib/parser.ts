@@ -7,8 +7,9 @@
  *   无标记时默认「新会话」；
  * - 标记行中标记之后的非空文本 = 任务标题；无标记时条目第一行非空文本 = 标题；
  *   其余非空行为提示词正文；条目只有一行时标题 = 正文首行；
- * - 裸标记行（标记后无标题）之后、标题行之前，允许出现保留字段行 `key: value`
- *   （v1 仅为未来扩展预留解析位，识别后忽略，不实现语义）；
+ * - 裸标记行（标记后无标题）之后、标题行之前，允许出现保留字段行 `key: value`：
+ *   `name` 已实现语义（显式会话命名，仅「新会话」裸标记条目；「继续」任务带 name 或值为空报错，
+ *   重复 name 以最后一个为准），其余键仅为未来扩展预留，识别后忽略；
  *   标题已确定后出现的 `key: value` 行一律视为正文，避免误吞普通文本；
  * - 提示词正文中的空行保留，整体 trim 首尾；
  * - 行尾兼容 CRLF/LF；解析结果为 0 个任务时报错。
@@ -70,6 +71,7 @@ export function parseManifest(content: string): BatchTask[] {
 function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | undefined {
 	let mode: TaskMode = "new";
 	let explicitTitle = "";
+	let sessionName: string | undefined;
 	let cursor = 0;
 
 	// (1) 模式标记行（可选）
@@ -93,7 +95,19 @@ function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | un
 					cursor++; // 保留字段：忽略
 					continue;
 				}
+				if (fieldMatch && fieldMatch[1] === "name") {
+					const value = (fieldMatch[2] ?? "").trim();
+					if (value === "") {
+						throw new ManifestParseError(`任务 ${oneBasedIndex}：name 字段值不能为空`, oneBasedIndex);
+					}
+					sessionName = value; // 重复 name: 以最后一个为准
+					cursor++;
+					continue;
+				}
 				break; // 第一行非字段文本 = 标题
+			}
+			if (sessionName !== undefined && mode === "continue") {
+				throw new ManifestParseError(`任务 ${oneBasedIndex}：name 字段仅对「新会话」任务有效`, oneBasedIndex);
 			}
 			if (cursor < entryLines.length) {
 				explicitTitle = (entryLines[cursor] ?? "").trim();
@@ -140,7 +154,7 @@ function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | un
 		throw new ManifestParseError(`任务 ${oneBasedIndex}（${title}）提示词正文为空`, oneBasedIndex);
 	}
 
-	return { index: oneBasedIndex, mode, title, prompt };
+	return { index: oneBasedIndex, mode, title, name: sessionName, prompt };
 }
 
 function firstLineOf(text: string): string {

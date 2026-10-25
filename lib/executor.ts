@@ -173,7 +173,8 @@ async function startWithFresh(
 	stop: StopHandle,
 ): Promise<void> {
 	const res = await leg.ctx.newSession({
-		name: `${state.batchTitle} · 任务${state.tasks[index]?.index ?? index + 1} ${state.tasks[index]?.title ?? ""}`.trimEnd(),
+		// 显式会话名（清单 name: 字段行）；未指定则不命名（name 为 undefined 时不传 setup）
+		name: state.tasks[index]?.name,
 		withSession: async (fresh) => {
 			await runFrom(d, fresh, state, index, stop);
 		},
@@ -189,7 +190,7 @@ async function startWithFresh(
 
 /**
  * 从第 i（0-based）个任务开始执行。
- * 遇到「新会话」任务：newSession（带会话名）→ 回调内先执行本条任务再循环推进；
+ * 遇到「新会话」任务：newSession（按清单 name: 字段显式命名，未指定则不命名）→ 回调内先执行本条任务再循环推进；
  * 回调返回后旧 leg 就地结束（return，不再推进也不收尾——收尾由最深层的 leg 完成）。
  * 「继续」任务与首条被标记继续的任务：在当前会话直接发送。
  */
@@ -208,7 +209,8 @@ async function runFrom(
 		if (record.mode === "new") {
 			progress.saveProgress(state);
 			const res = await leg.ctx.newSession({
-				name: `${state.batchTitle} · 任务${record.index} ${record.title}`,
+				// 显式会话名（清单 name: 字段行）；未指定则不命名
+				name: record.name,
 				withSession: async (fresh) => {
 					// 本条任务在全新会话中执行；后续任务在同一回调链内循环推进
 					const action = await runTask(d, fresh, state, i, stop);

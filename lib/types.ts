@@ -19,8 +19,10 @@ export interface BatchTask {
 	index: number;
 	/** 会话模式：new = 全新会话；continue = 沿用上一个任务的会话 */
 	mode: TaskMode;
-	/** 任务标题（用于状态栏、进度、汇总、会话命名） */
+	/** 任务标题（用于状态栏、进度、汇总；会话命名见 name） */
 	title: string;
+	/** 显式会话名（name: 保留字段行，仅对 mode === "new" 的裸标记条目合法；未指定则新会话不命名） */
+	name?: string;
 	/** 提示词正文（多行，已 trim 首尾） */
 	prompt: string;
 }
@@ -47,6 +49,8 @@ export interface TaskRecord {
 	index: number;
 	mode: TaskMode;
 	title: string;
+	/** 显式会话名（来自清单 name: 字段行；仅「新会话」任务有值，undefined 表示不命名） */
+	name?: string;
 	/** 提示词正文（来自清单解析） */
 	prompt: string;
 	status: TaskStatus;

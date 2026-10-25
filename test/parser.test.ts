@@ -76,6 +76,35 @@ describe("parseManifest", () => {
 		expect(tasks[0]!.prompt).toBe("正文");
 	});
 
+	it("裸标记后的 name: 字段捕获为会话名（标题与正文不受影响）", () => {
+		const tasks = parseManifest("---\n[新会话]\nname: 数据导入重构\n重构导入模块\n正文\n");
+		expect(tasks[0]!.name).toBe("数据导入重构");
+		expect(tasks[0]!.title).toBe("重构导入模块");
+		expect(tasks[0]!.prompt).toBe("正文");
+	});
+
+	it("name: 值为空时报错", () => {
+		expect(() => parseManifest("---\n[新会话]\nname:   \n标题\n正文\n")).toThrow(ManifestParseError);
+		expect(() => parseManifest("---\n[新会话]\nname:\n标题\n正文\n")).toThrow(/name 字段值不能为空/);
+	});
+
+	it("「继续」任务带 name: 时报错（消息含任务序号）", () => {
+		const run = () => parseManifest("---\n任务一\n正文一\n---\n[继续]\nname: x\n标题\n正文二\n");
+		expect(run).toThrow(ManifestParseError);
+		expect(run).toThrow(/任务 2：name 字段仅对「新会话」任务有效/);
+	});
+
+	it("重复 name: 行以最后一个为准", () => {
+		const tasks = parseManifest("---\n[新会话]\nname: 第一个\nname: 第二个\n标题\n正文\n");
+		expect(tasks[0]!.name).toBe("第二个");
+	});
+
+	it("标题已确定后的 name: 行属于正文（防误吞回归）", () => {
+		const tasks = parseManifest("---\n[新会话] 标题\nname: x\n正文\n");
+		expect(tasks[0]!.name).toBeUndefined();
+		expect(tasks[0]!.prompt).toBe("name: x\n正文");
+	});
+
 	it("标题确定后的 key: value 行视为正文（防误吞）", () => {
 		const tasks = parseManifest("---\nRefactor: import module\nmodel: 应该留在正文\n");
 		expect(tasks[0]!.title).toBe("Refactor: import module");
