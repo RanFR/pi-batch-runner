@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import { describe, expect, it } from "vitest";
 import { ManifestParseError, parseManifest, tokenizeArgs } from "../lib/parser.ts";
 
@@ -141,5 +142,85 @@ describe("tokenizeArgs", () => {
 	});
 	it("空字符串", () => {
 		expect(tokenizeArgs("")).toEqual([]);
+	});
+	it("单引号不支持（钉住现状：按普通非空白字符切分）", () => {
+		expect(tokenizeArgs("'a b'")).toEqual(["'a", "b'"]);
+	});
+	it("未闭合双引号（钉住现状：整体作为一个 token）", () => {
+		expect(tokenizeArgs('"abc')).toEqual(['"abc']);
+	});
+});
+
+describe("parseManifest：分隔符边界（钉住现状）", () => {
+	it("文件首行即 --- （空文件头）→ 正常解析首个任务", () => {
+		const tasks = parseManifest("---\n任务一\n正文\n");
+		expect(tasks).toHaveLength(1);
+		expect(tasks[0]).toMatchObject({ index: 1, title: "任务一", prompt: "正文" });
+	});
+
+	it("----（四连字符）不是分隔符：无合法分隔符时 0 任务报错", () => {
+		expect(() => parseManifest("----\n任务\n正文\n")).toThrow(ManifestParseError);
+	});
+
+	it("---abc 不是分隔符", () => {
+		expect(() => parseManifest("---abc\n任务\n正文\n")).toThrow(ManifestParseError);
+	});
+
+	it("正文行 a --- b 不分割", () => {
+		const tasks = parseManifest("---\n任务\n前半 --- 后半\n");
+		expect(tasks).toHaveLength(1);
+		expect(tasks[0]!.prompt).toBe("前半 --- 后半");
+	});
+
+	it("BOM 前缀的 --- 仍视为分隔符（\\s 含 BOM，钉住现状）", () => {
+		const tasks = parseManifest("\uFEFF---\n任务\n正文\n");
+		expect(tasks).toHaveLength(1);
+		expect(tasks[0]!.title).toBe("任务");
+	});
+});
+
+describe("parseManifest：保留字段行细节", () => {
+	it("name:x（冒号后无空格）仍捕获为会话名", () => {
+		const tasks = parseManifest("---\n[新会话]\nname:数据导出\n标题\n正文\n");
+		expect(tasks[0]!.name).toBe("数据导出");
+	});
+
+	it("name: 值含内部空格原样保留（仅 trim 首尾）", () => {
+		const tasks = parseManifest("---\n[新会话]\nname: my session name\n标题\n正文\n");
+		expect(tasks[0]!.name).toBe("my session name");
+	});
+
+	it("Model: x（大写开头）不匹配字段正则 → 作为标题", () => {
+		const tasks = parseManifest("---\n[新会话]\nModel: x\n正文\n");
+		expect(tasks[0]!.title).toBe("Model: x");
+		expect(tasks[0]!.name).toBeUndefined();
+	});
+
+	it("retries / max-turns / on-exhaust 保留字段被忽略", () => {
+		const tasks = parseManifest("---\n[新会话]\nretries: 5\nmax-turns: 10\non-exhaust: skip\n标题\n正文\n");
+		expect(tasks[0]!.title).toBe("标题");
+		expect(tasks[0]!.prompt).toBe("正文");
+		expect(tasks[0]!.name).toBeUndefined();
+	});
+
+	it("标记行标题前后空白归一", () => {
+		const tasks = parseManifest("---\n[新会话]  标题  \n正文\n");
+		expect(tasks[0]!.title).toBe("标题");
+	});
+});
+
+describe("parseManifest：示例文件守护（examples/tasks.example.md 契约）", () => {
+	it("示例清单解析为 4 个任务，模式与 name 字段符合文档", () => {
+		const content = fs.readFileSync(new URL("../examples/tasks.example.md", import.meta.url), "utf-8");
+		const tasks = parseManifest(content);
+		expect(tasks.map((t) => t.mode)).toEqual(["new", "continue", "new", "new"]);
+		expect(tasks.map((t) => t.index)).toEqual([1, 2, 3, 4]);
+		expect(tasks[0]!.title).toBe("重构数据导入模块");
+		expect(tasks[1]!.title).toBe("补充导入模块边界测试");
+		expect(tasks[2]!.title).toBe("修复登录页样式");
+		expect(tasks[3]!.name).toBe("数据导出专项");
+		expect(tasks[3]!.title).toBe("优化导出模块性能");
+		// 所有任务提示词非空
+		expect(tasks.every((t) => t.prompt.length > 0)).toBe(true);
 	});
 });

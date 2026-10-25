@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { startBatch, createStopHandle, type StartPoint, type StopHandle } from "../lib/executor.ts";
+import { startBatch, createStopHandle, lastAssistantMessage, type StartPoint, type StopHandle } from "../lib/executor.ts";
 import type {
 	BatchContext,
 	BatchLeg,
@@ -29,7 +29,7 @@ import type {
 // fake 基础设施
 // ============================================================================
 
-type Outcome = "ok" | "error" | "aborted" | "noshow";
+type Outcome = "ok" | "error" | "aborted" | "noshow" | "reject";
 
 interface SelectCall {
 	title: string;
@@ -82,6 +82,9 @@ interface Harness {
 	stop: StopHandle;
 	onSend?: (session: FakeSession, prompt: string) => void;
 	sendFailTimeoutMs: number;
+	neverDrain?: boolean;
+	throwOnWait?: boolean;
+	switchFails?: boolean;
 	settle: (outcome: Outcome) => void;
 	makeSession: (depth: number, sessionFile?: string) => FakeSession;
 }
@@ -93,6 +96,9 @@ function makeHarness(opts?: {
 	onExhaust?: OnExhaust;
 	newSessionCancelled?: boolean;
 	sendFailTimeoutMs?: number;
+	neverDrain?: boolean;
+	throwOnWait?: boolean;
+	switchFails?: boolean;
 }): { harness: Harness; state: BatchState; tmp: string } {
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-batch-test-"));
 	const listFile = path.join(tmp, "list.md");
@@ -113,6 +119,9 @@ function makeHarness(opts?: {
 		vnow: 1_000_000,
 		stop: createStopHandle(),
 		sendFailTimeoutMs: opts?.sendFailTimeoutMs ?? 1500,
+		neverDrain: opts?.neverDrain,
+		throwOnWait: opts?.throwOnWait,
+		switchFails: opts?.switchFails,
 	} as unknown as Harness;
 
 	const subscribers = new Set<(e: { aborted: boolean }) => void>();
@@ -180,7 +189,8 @@ function makeHarness(opts?: {
 				isIdle: () => session.idle,
 				hasPendingMessages: () => session.pending > 0,
 				waitForIdle: async () => {
-					session.pending = 0; // 空闲即队列已消化
+					if (harness.throwOnWait) throw new Error("wait boom");
+					if (!harness.neverDrain) session.pending = 0; // 空闲即队列已消化
 					while (!session.idle) await tick();
 				},
 				abort: () => {
@@ -204,6 +214,7 @@ function makeHarness(opts?: {
 				switchSession: async (p, o) => {
 					session.switchCalls.push(p);
 					harness.log.push(`switch:${p}`);
+					if (harness.switchFails) throw new Error("switch boom");
 					const target = harness.makeSession(depth + 1, p);
 					await o.withSession(target.leg);
 					return { cancelled: false };
@@ -217,6 +228,10 @@ function makeHarness(opts?: {
 				if (outcome === "noshow") {
 					// 发送被接受但运行永远不启动：保持 idle
 					return session.returnsPromise ? new Promise<void>(() => { }) : undefined;
+				}
+				if (outcome === "reject") {
+					// send promise 直接拒绝（对应 ReplacedSessionContext.sendUserMessage 失败路径）
+					return session.returnsPromise ? Promise.reject(new Error("send boom")) : undefined;
 				}
 				session.idle = false;
 				const p = new Promise<void>((resolve) => {
@@ -742,5 +757,139 @@ describe("executor：收尾行为", () => {
 
 		await run(h, state);
 		expect(sawRunning).toBe(true);
+	});
+});
+
+// ============================================================================
+// 补充：结果判定 / 发送异常 / 降级与兜底 / 排水超时 / 预设停止
+// ============================================================================
+
+describe("lastAssistantMessage（导出函数单测）", () => {
+	it("空 branch → undefined", () => {
+		const ctx = { sessionManager: { getSessionFile: () => undefined, getBranch: () => [] } } as unknown as BatchContext;
+		expect(lastAssistantMessage(ctx)).toBeUndefined();
+	});
+
+	it("从分支末尾向前找最后一条 assistant，跳过 user 与非 message 条目", () => {
+		const branch: BranchEntryView[] = [
+			{ type: "message", message: { role: "user" } },
+			{ type: "summary" },
+			{ type: "message", message: { role: "assistant", stopReason: "stop", errorMessage: undefined } },
+			{ type: "message", message: { role: "user" } },
+		];
+		const ctx = { sessionManager: { getSessionFile: () => undefined, getBranch: () => branch } } as unknown as BatchContext;
+		expect(lastAssistantMessage(ctx)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("branch 上没有 assistant → undefined", () => {
+		const branch: BranchEntryView[] = [{ type: "message", message: { role: "user" } }];
+		const ctx = { sessionManager: { getSessionFile: () => undefined, getBranch: () => branch } } as unknown as BatchContext;
+		expect(lastAssistantMessage(ctx)).toBeUndefined();
+	});
+});
+
+describe("executor：发送异常", () => {
+	it("send 同步抛异常 → send-failed（retries 0 + skip → failed）", async () => {
+		const { harness: h, state } = makeHarness({ retries: 0, onExhaust: "skip" });
+		h.onSend = () => {
+			throw new Error("sync boom");
+		};
+		addTasks(state, [["continue", "发不出去"]]);
+
+		await run(h, state);
+
+		expect(state.tasks[0]).toMatchObject({ status: "failed", attempts: 1 });
+		expect(state.tasks[0]!.error).toContain("发送失败");
+		expect(state.tasks[0]!.error).toContain("sync boom");
+	});
+
+	it("send 返回 rejected Promise → send-failed，后续任务正常", async () => {
+		const { harness: h, state } = makeHarness({ outcomes: ["reject", "ok"], retries: 0, onExhaust: "skip" });
+		addTasks(state, [
+			["new", "发不出去"],
+			["continue", "后续"],
+		]);
+
+		await run(h, state);
+
+		expect(state.tasks[0]).toMatchObject({ status: "failed", attempts: 1 });
+		expect(state.tasks[0]!.error).toContain("发送失败");
+		expect(state.tasks[0]!.error).toContain("send boom");
+		expect(state.tasks[1]!.status).toBe("ok");
+	});
+});
+
+describe("executor：降级与内部错误兜底", () => {
+	it("switch 起点 switchSession 抛错 → notify 降级 → 新会话中继续执行", async () => {
+		const { harness: h, state } = makeHarness({ outcomes: ["ok"], switchFails: true });
+		addTasks(state, [
+			["new", "已完成"],
+			["continue", "断点任务"],
+		]);
+		state.tasks[0]!.status = "ok";
+		state.tasks[0]!.sessionFile = path.join("/tmp", "prev-session.jsonl");
+
+		await run(h, state, { kind: "switch", sessionFile: state.tasks[0]!.sessionFile, index: 1 });
+
+		expect(h.notifies.some((n) => n.type === "warning" && n.message.includes("无法恢复会话"))).toBe(true);
+		expect(h.root.newSessionCalls).toBe(1);
+		expect(h.root.children[0]!.sends).toEqual(["prompt-2-断点任务"]);
+		expect(state.tasks[1]!.status).toBe("ok");
+	});
+
+	it("fresh 起点 + newSession 被取消 → 终止整批并收尾", async () => {
+		const { harness: h, state } = makeHarness({ outcomes: ["ok"], newSessionCancelled: true });
+		addTasks(state, [
+			["new", "已完成"],
+			["continue", "断点任务"],
+		]);
+		state.tasks[0]!.status = "ok";
+
+		await run(h, state, { kind: "fresh", index: 1 });
+
+		expect(h.notifies.some((n) => n.message.includes("会话切换被取消"))).toBe(true);
+		expect(state.tasks[1]!.status).toBe("pending");
+		expect(h.batchEnded).toBe(1);
+	});
+
+	it("waitForIdle 抛错 → startBatch 兜底收尾（内部错误汇总 + running 重置 pending + report 仍生成）", async () => {
+		const { harness: h, state, tmp } = makeHarness({ outcomes: ["ok"], throwOnWait: true });
+		addTasks(state, [["continue", "任务一"]]);
+
+		await run(h, state);
+
+		expect(h.notifies.some((n) => n.message.includes("内部错误"))).toBe(true);
+		expect(h.batchEnded).toBe(1);
+		expect(fs.existsSync(path.join(tmp, "list.md.report.md"))).toBe(true);
+		expect(state.tasks[0]!.status).toBe("pending");
+		expect(state.tasks[0]!.error).toBe("批次提前结束");
+	});
+});
+
+describe("executor：排队消化超时与预设停止", () => {
+	it("排队消息永不消化 → 超过 5 分钟排水上限按 send-failed 处理", async () => {
+		const { harness: h, state } = makeHarness({ retries: 0, onExhaust: "skip", neverDrain: true });
+		addTasks(state, [["continue", "排不上队"]]);
+		h.root.pending = 2;
+
+		await run(h, state);
+
+		expect(state.tasks[0]).toMatchObject({ status: "failed" });
+		expect(state.tasks[0]!.error).toContain("等待既有排队消息消化超时");
+	}, 20_000);
+
+	it("运行前已置 stopFlag=gentle → 立即收尾，全部任务保持 pending", async () => {
+		const { harness: h, state } = makeHarness({ outcomes: [] });
+		addTasks(state, [
+			["continue", "任务一"],
+			["continue", "任务二"],
+		]);
+		h.stop.stopFlag = "gentle";
+
+		await run(h, state);
+
+		expect(h.root.sends).toHaveLength(0);
+		expect(state.tasks.map((t) => t.status)).toEqual(["pending", "pending"]);
+		expect(h.notifies.some((n) => n.message.includes("未执行 2"))).toBe(true);
 	});
 });
