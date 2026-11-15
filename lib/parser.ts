@@ -1,7 +1,7 @@
 /**
  * Manifest file parsing.
  *
- * Format spec (PLAN section 4):
+ * Format spec:
  * - Entries are separated by a lone `---` line (surrounding whitespace allowed);
  *   everything before the first `---` is ignored (may hold batch notes);
  * - If an entry's first line matches ^[new] or ^[continue] (case-insensitive)

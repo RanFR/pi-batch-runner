@@ -1,8 +1,8 @@
 /**
  * Execution engine (core).
  *
- * Design notes (PLAN sections 6/7; verified against pi 1.4.0 sources, re-checked
- * on 1.5.2 with no changes):
+ * Design notes (verified against pi 1.4.0 sources, re-checked on 1.5.2 with
+ * no changes):
  *
  * 1. The engine is driven by the /batch command handler: newSession/
  *    switchSession/waitForIdle may only run inside a command-handler context —

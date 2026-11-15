@@ -93,15 +93,6 @@ name: 数据导出专项
 | `/new` / `/resume` / `/fork` | 不建议：引擎持有的会话上下文失效，批次会以内部错误结束（汇总报告仍会生成） |
 | 直接输入新消息 | 会被 pi 排队在当前 run 之后执行，批处理相应推迟——**不建议**；需要干预用上表操作 |
 
-## 与开发计划（PLAN.md）的偏差
-
-实现过程中经 pi 1.4.0 源码/实测确认的四处调整（相关机制在 1.5.2 复核无变化）：
-
-1. **会话命名**（PLAN 6.7）：原方案 `pendingName` 写入 progress 文件 + `session_start` 处理器调 `pi.setSessionName`。实测会话替换后旧 `pi` 门面已失效（调用即抛 stale 错误，且在 `withSession` 链路中为致命错误），改为 `newSession({ setup: (sm) => sm.appendSessionInfo(name) })` 直写 sessionManager，效果相同且无需文件中转。
-2. **settled 事件订阅**：`pi.on` 不能在批次运行中调用（stale），改为 factory 期注册 `agent_settled` 桥 + **模块级监听槽位**。注意 pi 每次会话替换都会重新执行扩展工厂（jiti 仅缓存工厂函数对象），因此接线状态必须放模块作用域——工厂体内的闭包变量每次替换都会重建（这是本次开发踩过的真实陷阱）。
-3. **重试耗尽后的任务状态**：耗尽后（无论 skip 配置还是 pause 中选跳过）任务定案为 `failed` 并保留最后一次错误——比一律记 `skipped` 更利于汇总判读；`skipped` 保留给未实际运行的任务（`--start` 跳过、中断后跳过）。
-4. **会话命名策略**：移除 `批次名 · 任务N 标题` 自动命名，改为仅当任务写有 `name:` 保留字段行（裸标记行之后、标题行之前）时显式命名（机制仍为 `newSession({ setup })` 直写 sessionManager，见第 1 点），未指定则默认不命名。
-
 ## 开发
 
 ```bash

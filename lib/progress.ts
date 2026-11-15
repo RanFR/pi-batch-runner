@@ -4,7 +4,7 @@
  * - Progress file: `<manifest>.progress.json`, a disk mirror of BatchState and
  *   the single source of truth for batch state (the extension factory re-runs on
  *   every session replacement, so factory-scoped state is unreliable; see the
- *   module-level state notes in index.ts and PLAN pitfall 5);
+ *   module-level state notes in index.ts);
  * - When a batch finishes, the file is renamed to
  *   `<manifest>.progress.done.json` so the next launch does not offer a resume;
  * - Summary report: `<manifest>.report.md`.
@@ -75,8 +75,7 @@ export function writeReport(listFile: string, content: string): void {
 	fs.writeFileSync(reportPathFor(listFile), content, "utf-8");
 }
 
-// Historical note: the pendingName/session_start naming mechanism from PLAN 6.7
-// was replaced by writing the name directly via newSession({ setup }). The old
+// Historical note: the pendingName/session_start naming mechanism was replaced by writing the name directly via newSession({ setup }). The old
 // pi facade goes stale after a session replacement (a fatal error in practice),
 // and pi.setSessionName is unavailable inside session_start handlers, so the
 // file-based relay was dropped.

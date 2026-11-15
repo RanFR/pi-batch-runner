@@ -50,7 +50,7 @@ const USAGE = [
  *
  * Therefore only "wiring" state may live here: event-listener slots and
  * re-entrancy flags. Batch data always uses the progress file as the single
- * source of truth (PLAN pitfall 5).
+ * source of truth.
  *
  * Warning: /reload re-evaluates this module in a new generation, zeroing both
  * settledListener and activeBatch. The running engine closure still holds the
