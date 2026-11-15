@@ -142,6 +142,27 @@ describe("tokenizeArgs", () => {
 	it("double quotes group a path containing spaces", () => {
 		expect(tokenizeArgs('"my tasks.md" --retries 2')).toEqual(["my tasks.md", "--retries", "2"]);
 	});
+	it("strips pi's @ file-mention prefix from a bare token", () => {
+		expect(tokenizeArgs("@tasks.md --dry-run")).toEqual(["tasks.md", "--dry-run"]);
+	});
+	it('strips the @ before a quoted path (pi inserts @"my tasks.md" for spaced names)', () => {
+		expect(tokenizeArgs('@"my tasks.md" --retries 2')).toEqual(["my tasks.md", "--retries", "2"]);
+	});
+	it("strips @ wherever a token starts, not only in the first token", () => {
+		expect(tokenizeArgs("--dry-run @tasks.md")).toEqual(["--dry-run", "tasks.md"]);
+	});
+	it("@ inside a token is untouched (only a token-leading @ is a mention)", () => {
+		expect(tokenizeArgs("user@host.md")).toEqual(["user@host.md"]);
+	});
+	it("quoted tokens are verbatim: a leading @ inside quotes is kept", () => {
+		expect(tokenizeArgs('"@weird name.md"')).toEqual(["@weird name.md"]);
+	});
+	it("a lone @ survives (nothing to point at)", () => {
+		expect(tokenizeArgs("@")).toEqual(["@"]);
+	});
+	it("a double @@ strips only one layer (remaining @ treated as literal path)", () => {
+		expect(tokenizeArgs("@@x.md")).toEqual(["@x.md"]);
+	});
 	it("empty string", () => {
 		expect(tokenizeArgs("")).toEqual([]);
 	});

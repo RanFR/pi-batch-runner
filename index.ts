@@ -207,6 +207,10 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 
 	async function dispatch(rawArgs: string, ctx: ExtensionCommandContext): Promise<void> {
 		debugCmd(`dispatch args=${JSON.stringify(rawArgs)} mode=${ctx.mode} activeBatch=${activeBatch ? "yes" : "null"}`);
+		// tokenizeArgs also strips pi's `@` file-mention prefix: the editor inserts
+		// completions as `@path`, and the core hands command args over verbatim
+		// (nothing expands `@` on the command path), so `/batch @list.md` must
+		// resolve like `/batch list.md`.
 		const tokens = tokenizeArgs(rawArgs.trim());
 		if (tokens.length === 0) {
 			ctx.ui.notify(USAGE, "info");

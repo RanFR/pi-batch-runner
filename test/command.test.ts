@@ -384,6 +384,48 @@ describe("command layer: argument validation (zero side effects)", () => {
 });
 
 // ============================================================================
+// pi @ file-mention compatibility
+// ============================================================================
+
+// pi's editor inserts file completions as `@path` / `@"path with spaces"` and
+// the core passes command args to extensions verbatim, so the raw args can
+// carry the `@`; the batch must resolve them like plain paths (regression
+// guard for the tokenizeArgs normalization).
+describe("command layer: pi @ file-mention compatibility", () => {
+	it("@list.md runs like a plain path", async () => {
+		const { world, cmd, ctx } = await setup();
+		await cmd.handler("@list.md", ctx);
+		expect(world.sent).toHaveLength(2);
+		expect(readDone(world).tasks.map((t: any) => t.status)).toEqual(["ok", "ok"]);
+	});
+
+	it('@"my list.md" (quoted at-prefix, spaced filename) runs like the bare quoted form', async () => {
+		const { world, cmd, ctx } = await setup();
+		writeManifest(world, "my list.md", TWO_CONTINUE);
+		await cmd.handler('@"my list.md"', ctx);
+		expect(world.sent).toHaveLength(2);
+		const done = JSON.parse(fs.readFileSync(path.join(world.tmp, "my list.md.progress.json.done"), "utf-8"));
+		expect(done.tasks.map((t: any) => t.status)).toEqual(["ok", "ok"]);
+	});
+
+	it("@list.md --dry-run → preview only, nothing sent", async () => {
+		const { world, cmd, ctx } = await setup();
+		await cmd.handler("@list.md --dry-run", ctx);
+		expect(world.sent).toHaveLength(0);
+		expect(world.widgets.at(-1)?.[0]).toContain("批处理预览");
+	});
+
+	it("@nope.md → 清单文件不存在, error cites the normalized (bare) path", async () => {
+		const { world, cmd, ctx } = await setup();
+		await cmd.handler("@nope.md", ctx);
+		expect(lastNotify(world).type).toBe("error");
+		expect(lastNotify(world).message).toContain(path.join(world.tmp, "nope.md"));
+		expect(world.sent).toHaveLength(0);
+		expect(fs.existsSync(progressPath(world))).toBe(false);
+	});
+});
+
+// ============================================================================
 // Pre-flight rejections
 // ============================================================================
 

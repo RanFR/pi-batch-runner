@@ -174,15 +174,33 @@ function firstLineOf(text: string): string {
  *
  * Double quotes group a path containing spaces into a single token.
  *
+ * A `@` at the start of a token is stripped: pi's editor inserts file
+ * completions as `@path` / `@"path with spaces"`, and the core passes command
+ * arguments to extensions verbatim (the `@` is a completion trigger only —
+ * unlike plain prompts, nothing expands it on the command path), so
+ * `/batch @tasks.md` must behave like `/batch tasks.md`. `@` inside a token
+ * or inside quotes is kept verbatim; a lone `@` survives.
+ *
  * @example
  * tokenizeArgs('"my tasks.md" --dry-run'); // => ["my tasks.md", "--dry-run"]
+ * tokenizeArgs("@tasks.md --dry-run"); // => ["tasks.md", "--dry-run"]
+ * tokenizeArgs('"@my tasks.md"'); // => ["@my tasks.md"] (quoted: verbatim)
  */
 export function tokenizeArgs(raw: string): string[] {
 	const tokens: string[] = [];
-	const re = /"([^"]*)"|(\S+)/g;
+	// The optional `@` before a quote recognizes pi's `@"..."` completion form;
+	// without it, `\S+` would swallow `@"my` and split the quoted path.
+	const re = /@?"([^"]*)"|(\S+)/g;
 	let m: RegExpExecArray | null;
 	while ((m = re.exec(raw)) !== null) {
-		tokens.push(m[1] ?? m[2] ?? "");
+		if (m[1] !== undefined) {
+			// Quoted token: verbatim (a `@` inside quotes is part of the path).
+			tokens.push(m[1]);
+		} else {
+			const bare = m[2] ?? "";
+			// Token-leading `@` = pi's file-mention prefix, not part of the path.
+			tokens.push(bare.startsWith("@") && bare.length > 1 ? bare.slice(1) : bare);
+		}
 	}
 	return tokens;
 }
