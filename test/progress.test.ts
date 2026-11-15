@@ -52,13 +52,13 @@ function makeState(overrides?: Partial<BatchState>): BatchState {
 	};
 }
 
-describe("路径拼接与状态判定（lib/types.ts）", () => {
+describe("path helpers and status predicates (lib/types.ts)", () => {
 	it("progressPathFor / reportPathFor", () => {
 		expect(progressPathFor("/a/b/list.md")).toBe("/a/b/list.md.progress.json");
 		expect(reportPathFor("/a/b/list.md")).toBe("/a/b/list.md.report.md");
 	});
 
-	it("isTerminalStatus 真值表", () => {
+	it("isTerminalStatus truth table", () => {
 		const terminal: TaskStatus[] = ["ok", "failed", "skipped"];
 		const open: TaskStatus[] = ["pending", "running"];
 		for (const s of terminal) expect(isTerminalStatus(s)).toBe(true);
@@ -67,11 +67,11 @@ describe("路径拼接与状态判定（lib/types.ts）", () => {
 });
 
 describe("loadProgress", () => {
-	it("文件不存在 → null", () => {
+	it("missing file → null", () => {
 		expect(progress.loadProgress(listFile)).toBeNull();
 	});
 
-	it("非法 JSON → null", () => {
+	it("invalid JSON → null", () => {
 		fs.writeFileSync(progressPathFor(listFile), "{not json", "utf-8");
 		expect(progress.loadProgress(listFile)).toBeNull();
 	});
@@ -81,12 +81,12 @@ describe("loadProgress", () => {
 		expect(progress.loadProgress(listFile)).toBeNull();
 	});
 
-	it("tasks 非数组 → null", () => {
+	it("tasks not an array → null", () => {
 		fs.writeFileSync(progressPathFor(listFile), JSON.stringify({ schemaVersion: 1, tasks: "nope" }), "utf-8");
 		expect(progress.loadProgress(listFile)).toBeNull();
 	});
 
-	it("saveProgress → loadProgress 往返一致", () => {
+	it("saveProgress → loadProgress round-trips faithfully", () => {
 		const state = makeState();
 		progress.saveProgress(state);
 		const loaded = progress.loadProgress(listFile);
@@ -103,7 +103,7 @@ describe("loadProgress", () => {
 });
 
 describe("saveProgress", () => {
-	it("覆写时更新 updatedAt", () => {
+	it("refreshes updatedAt on overwrite", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
 		const state = makeState();
@@ -115,16 +115,16 @@ describe("saveProgress", () => {
 		expect(second).toBeGreaterThan(first);
 	});
 
-	it("写入为带缩进的合法 JSON（可读格式）", () => {
+	it("writes readable, indented JSON", () => {
 		progress.saveProgress(makeState());
 		const raw = fs.readFileSync(progressPathFor(listFile), "utf-8");
-		expect(raw).toContain("\n\t"); // tab 缩进
+		expect(raw).toContain("\n\t"); // tab indentation
 		expect(() => JSON.parse(raw)).not.toThrow();
 	});
 });
 
 describe("finishProgress", () => {
-	it("存在时改名 .progress.json.done 并返回目标路径", () => {
+	it("renames to .progress.json.done when present and returns the target path", () => {
 		progress.saveProgress(makeState());
 		const from = progressPathFor(listFile);
 		const to = progress.finishProgress(listFile);
@@ -133,13 +133,13 @@ describe("finishProgress", () => {
 		expect(fs.existsSync(to!)).toBe(true);
 	});
 
-	it("源文件不存在 → null 且不抛错", () => {
+	it("missing source → null without throwing", () => {
 		expect(progress.finishProgress(listFile)).toBeNull();
 	});
 });
 
 describe("backupDoneProgress", () => {
-	it("存在 .done → 生成带时间戳的 .bak 备份", () => {
+	it("backs up an existing .done into a timestamped .bak", () => {
 		const donePath = `${progressPathFor(listFile)}.done`;
 		fs.writeFileSync(donePath, "{}", "utf-8");
 		progress.backupDoneProgress(listFile);
@@ -149,14 +149,14 @@ describe("backupDoneProgress", () => {
 		expect(entries[0]!.startsWith("list.md.progress.json.done.")).toBe(true);
 	});
 
-	it("不存在 .done 时无副作用、不抛错", () => {
+	it("no-op without throwing when no .done exists", () => {
 		expect(() => progress.backupDoneProgress(listFile)).not.toThrow();
 		expect(fs.readdirSync(tmp).filter((e) => e.includes("progress"))).toHaveLength(0);
 	});
 });
 
 describe("writeReport", () => {
-	it("落盘内容一致，写到 <清单>.report.md", () => {
+	it("writes content verbatim to <manifest>.report.md", () => {
 		const content = "# 报告\n\n内容行";
 		progress.writeReport(listFile, content);
 		expect(fs.readFileSync(reportPathFor(listFile), "utf-8")).toBe(content);

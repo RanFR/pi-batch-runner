@@ -1,10 +1,15 @@
 /**
- * 命令层测试：驱动真实 index.ts 扩展工厂（fake ExtensionAPI / ExtensionCommandContext）。
+ * Command-layer tests: drive the real index.ts extension factory with a fake
+ * ExtensionAPI / ExtensionCommandContext.
  *
- * - 每个用例 vi.resetModules() 后动态 import，隔离 index.ts 模块级 activeBatch/settledListener；
- * - fake pi.sendUserMessage 对应根会话（返回 void）；fake newSession/switchSession 构造的
- *   fresh 上下文对应 ReplacedSessionContext（sendUserMessage 返回 settle 时 resolve 的 Promise）；
- * - holdSettle 模式不自动结算，由用例显式 world.settleCurrent(outcome) 推进（编排类用例）。
+ * - Each test dynamically imports index.ts after vi.resetModules(), isolating
+ *   the module-level activeBatch/settledListener between tests;
+ * - The fake pi.sendUserMessage models the root session (returns void); the
+ *   fresh contexts built by fake newSession/switchSession model
+ *   ReplacedSessionContext (sendUserMessage returns a Promise resolving on
+ *   settle);
+ * - In holdSettle mode nothing settles automatically; tests advance explicitly
+ *   via world.settleCurrent(outcome) (orchestration-style tests).
  */
 
 import * as fs from "node:fs";
@@ -13,7 +18,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // ============================================================================
-// fake 基础设施
+// Fake infrastructure
 // ============================================================================
 
 type UiType = "info" | "warning" | "error" | undefined;
@@ -59,8 +64,8 @@ const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
 const openWorlds: Array<{ tmp: string }> = [];
 
-const TWO_CONTINUE = "---\n[继续] 任务一\n正文一\n---\n[继续] 任务二\n正文二\n";
-const THREE_CONTINUE = `${TWO_CONTINUE}---\n[继续] 任务三\n正文三\n`;
+const TWO_CONTINUE = "---\n[continue] 任务一\n正文一\n---\n[continue] 任务二\n正文二\n";
+const THREE_CONTINUE = `${TWO_CONTINUE}---\n[continue] 任务三\n正文三\n`;
 
 function writeManifest(world: { tmp: string }, name: string, content: string): string {
 	const p = path.join(world.tmp, name);
@@ -181,7 +186,7 @@ async function setup(worldOpts?: SetupOpts) {
 		return makeSessionCtx(st);
 	}
 
-	/** 根命令上下文与 fresh（ReplacedSessionContext 形状）上下文共用同一结构 */
+	/** The root command context and fresh (ReplacedSessionContext-shaped) contexts share the same structure. */
 	function makeSessionCtx(st: SessionState): any {
 		return {
 			mode: worldOpts?.mode ?? "tui",
@@ -222,7 +227,13 @@ async function setup(worldOpts?: SetupOpts) {
 				withSession: (fresh: unknown) => Promise<void>;
 			}) => {
 				world.newSessionCalls.push({ name: o.name, hasSetup: typeof o.setup === "function" });
-				if (o.setup) await o.setup({ appendSessionInfo: (n: string) => { world.appendSessionNames.push(n); return n; } });
+				if (o.setup)
+					await o.setup({
+						appendSessionInfo: (n: string) => {
+							world.appendSessionNames.push(n);
+							return n;
+						},
+					});
 				if (world.newSessionCancelled) return { cancelled: true };
 				await o.withSession(freshChild());
 				return { cancelled: false };
@@ -254,7 +265,7 @@ async function setup(worldOpts?: SetupOpts) {
 	const cmd = world.command;
 	if (!cmd) throw new Error("/batch command not registered");
 
-	// 默认清单：两个「继续」任务（用例可覆写同名文件）
+	// Default manifest: two "continue" tasks (tests may overwrite the same file).
 	writeManifest(world, "list.md", TWO_CONTINUE);
 	return { world, cmd, ctx: world.rootCtx };
 }
@@ -265,11 +276,11 @@ afterEach(() => {
 });
 
 // ============================================================================
-// 路由与无批次守卫
+// Routing and no-batch guards
 // ============================================================================
 
-describe("命令层：路由与无批次守卫", () => {
-	it("空参数 → 用法说明（info）", async () => {
+describe("command layer: routing and no-batch guards", () => {
+	it("empty args → usage (info)", async () => {
 		const { world, cmd, ctx } = await setup();
 		await cmd.handler("", ctx);
 		expect(lastNotify(world).type).toBe("info");
@@ -277,19 +288,19 @@ describe("命令层：路由与无批次守卫", () => {
 		expect(lastNotify(world).message).toContain("--dry-run");
 	});
 
-	it("stop（无运行批次）→ 当前没有运行中的批次", async () => {
+	it("stop (no running batch) → 当前没有运行中的批次", async () => {
 		const { world, cmd, ctx } = await setup();
 		await cmd.handler("stop", ctx);
 		expect(lastNotify(world).message).toBe("当前没有运行中的批次");
 	});
 
-	it("status（无进度文件）→ 当前没有正在运行或未完成的批次", async () => {
+	it("status (no progress file) → 当前没有正在运行或未完成的批次", async () => {
 		const { world, cmd, ctx } = await setup();
 		await cmd.handler("status", ctx);
 		expect(lastNotify(world).message).toBe("当前没有正在运行或未完成的批次");
 	});
 
-	it("status（cwd 存在 progress 文件）→ 汇总行 notify + widget", async () => {
+	it("status (progress file in cwd) → summary notify + widget", async () => {
 		const { world, cmd, ctx } = await setup();
 		writeProgress(world, [savedTask(1, "new", "ok"), savedTask(2, "continue", "pending")]);
 		await cmd.handler("status", ctx);
@@ -298,7 +309,7 @@ describe("命令层：路由与无批次守卫", () => {
 		expect(widget?.[0]).toContain("── 批处理 · list ·");
 	});
 
-	it("status（cwd 多个 progress 文件）→ 取修改时间最新的，不依赖 readdir 顺序", async () => {
+	it("status (multiple progress files in cwd) → picks the newest mtime, readdir order irrelevant", async () => {
 		const { world, cmd, ctx } = await setup();
 		writeProgress(world, [savedTask(1, "new", "ok"), savedTask(2, "continue", "ok")]);
 		const other = {
@@ -312,7 +323,8 @@ describe("命令层：路由与无批次守卫", () => {
 			tasks: [savedTask(1, "new", "pending")],
 		};
 		fs.writeFileSync(path.join(world.tmp, "other.md.progress.json"), JSON.stringify(other), "utf-8");
-		// 显式设定 mtime：other 比 list 新 10s（消除写入顺序与时间分辨率的抖动）
+		// Set mtimes explicitly: other is 10s newer than list (removes write-order
+		// and timer-resolution flakiness).
 		const now = Date.now();
 		fs.utimesSync(path.join(world.tmp, "other.md.progress.json"), new Date(now), new Date(now));
 		fs.utimesSync(progressPath(world), new Date(now - 10_000), new Date(now - 10_000));
@@ -324,10 +336,10 @@ describe("命令层：路由与无批次守卫", () => {
 });
 
 // ============================================================================
-// 参数校验（全部零副作用）
+// Argument validation (all side-effect free)
 // ============================================================================
 
-describe("命令层：参数校验（零副作用）", () => {
+describe("command layer: argument validation (zero side effects)", () => {
 	const cases: Array<[string, string]> = [
 		["list.md --foo", "未知选项：--foo"],
 		["--dry-run", "缺少清单文件参数"],
@@ -356,14 +368,14 @@ describe("命令层：参数校验（零副作用）", () => {
 		});
 	}
 
-	it("--start 超出任务总数", async () => {
+	it("--start beyond the task count", async () => {
 		const { world, cmd, ctx } = await setup();
 		await cmd.handler("list.md --start 5", ctx);
 		expect(lastNotify(world).message).toBe("--start 5 超出任务总数（2）");
 		expect(world.sent).toHaveLength(0);
 	});
 
-	it("--start 1.5 被 parseInt 截断为 1（钉住现状：正常执行）", async () => {
+	it("--start 1.5 is truncated to 1 by parseInt (pins current behavior: runs normally)", async () => {
 		const { world, cmd, ctx } = await setup();
 		await cmd.handler("list.md --start 1.5", ctx);
 		expect(world.sent).toHaveLength(2);
@@ -372,12 +384,12 @@ describe("命令层：参数校验（零副作用）", () => {
 });
 
 // ============================================================================
-// 前置拒绝
+// Pre-flight rejections
 // ============================================================================
 
-describe("命令层：前置拒绝", () => {
-	it("print 模式且无 UI → notify error + console.error", async () => {
-		const spy = vi.spyOn(console, "error").mockImplementation(() => { });
+describe("command layer: pre-flight rejections", () => {
+	it("print mode without UI → notify error + console.error", async () => {
+		const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const { world, cmd, ctx } = await setup({ mode: "print", hasUI: false });
 		await cmd.handler("list.md", ctx);
 		expect(lastNotify(world).type).toBe("error");
@@ -385,8 +397,8 @@ describe("命令层：前置拒绝", () => {
 		expect(spy).toHaveBeenCalledTimes(1);
 	});
 
-	it("rpc 模式（有 UI）→ 仅 notify，不落 stderr", async () => {
-		const spy = vi.spyOn(console, "error").mockImplementation(() => { });
+	it("rpc mode (with UI) → notify only, nothing on stderr", async () => {
+		const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const { world, cmd, ctx } = await setup({ mode: "rpc", hasUI: true });
 		await cmd.handler("list.md", ctx);
 		expect(lastNotify(world).type).toBe("error");
@@ -394,7 +406,7 @@ describe("命令层：前置拒绝", () => {
 		expect(spy).not.toHaveBeenCalled();
 	});
 
-	it("agent 忙碌（非 idle）→ 拒绝启动", async () => {
+	it("agent busy (not idle) → refuses to start", async () => {
 		const { world, cmd, ctx } = await setup({ isIdle: false });
 		await cmd.handler("list.md", ctx);
 		expect(lastNotify(world).message).toBe("智能体正在运行，请等待空闲后再启动批处理");
@@ -403,11 +415,11 @@ describe("命令层：前置拒绝", () => {
 });
 
 // ============================================================================
-// 清单读取错误
+// Manifest read errors
 // ============================================================================
 
-describe("命令层：清单读取错误", () => {
-	it("路径是目录 → 读取清单失败", async () => {
+describe("command layer: manifest read errors", () => {
+	it("path is a directory → 读取清单失败", async () => {
 		const { world, cmd, ctx } = await setup();
 		fs.mkdirSync(path.join(world.tmp, "dir.md"));
 		await cmd.handler("dir.md", ctx);
@@ -416,7 +428,7 @@ describe("命令层：清单读取错误", () => {
 		expect(world.sent).toHaveLength(0);
 	});
 
-	it("清单无分隔符 → 清单解析失败", async () => {
+	it("manifest without separators → 清单解析失败", async () => {
 		const { world, cmd, ctx } = await setup();
 		writeManifest(world, "broken.md", "只有说明\n没有任务\n");
 		await cmd.handler("broken.md", ctx);
@@ -426,34 +438,34 @@ describe("命令层：清单读取错误", () => {
 });
 
 // ============================================================================
-// dry-run 预览与带空格路径
+// dry-run preview and paths with spaces
 // ============================================================================
 
-describe("命令层：dry-run 预览", () => {
+describe("command layer: dry-run preview", () => {
 	const NAMED_MANIFEST = [
 		"---",
-		"[新会话] 任务一",
+		"[new] 任务一",
 		"正文一",
 		"---",
-		"[继续] 任务二",
+		"[continue] 任务二",
 		"正文二",
 		"---",
-		"[新会话]",
+		"[new]",
 		"name: 专项",
 		"优化导出模块性能",
 		"正文三",
 		"",
 	].join("\n");
 
-	it("预览 widget、会话名标注与通知；零副作用", async () => {
+	it("preview widget, session-name annotations, and notice; zero side effects", async () => {
 		const { world, cmd, ctx } = await setup();
 		writeManifest(world, "list.md", NAMED_MANIFEST);
 		await cmd.handler("list.md --dry-run", ctx);
 
 		const widget = world.widgets.at(-1)!;
 		expect(widget[0]).toContain("批处理预览 · list.md · 共 3 个任务");
-		expect(widget[1]).toBe("[新会话]  1 任务一");
-		expect(widget[2]).toContain("[继续]");
+		expect(widget[1]).toBe("[new]  1 任务一");
+		expect(widget[2]).toContain("[continue]");
 		expect(widget[2]).toContain("任务二");
 		expect(widget[3]).toContain("会话名: 专项");
 		expect(lastNotify(world).message).toContain("预览模式：共 3 个任务，未执行");
@@ -461,7 +473,7 @@ describe("命令层：dry-run 预览", () => {
 		expect(fs.existsSync(progressPath(world))).toBe(false);
 	});
 
-	it("--start 2：标题行带起始提示，越前任务标注跳过", async () => {
+	it("--start 2: header notes the start, earlier tasks annotated as skipped", async () => {
 		const { world, cmd, ctx } = await setup();
 		writeManifest(world, "list.md", NAMED_MANIFEST);
 		await cmd.handler("list.md --dry-run --start 2", ctx);
@@ -472,7 +484,7 @@ describe("命令层：dry-run 预览", () => {
 		expect(world.sent).toHaveLength(0);
 	});
 
-	it("带空格路径（双引号）+ dry-run", async () => {
+	it("path with spaces (double-quoted) + dry-run", async () => {
 		const { world, cmd, ctx } = await setup();
 		writeManifest(world, "my tasks.md", TWO_CONTINUE);
 		await cmd.handler('"my tasks.md" --dry-run', ctx);
@@ -482,11 +494,11 @@ describe("命令层：dry-run 预览", () => {
 });
 
 // ============================================================================
-// tab 补全
+// Tab completion
 // ============================================================================
 
-describe("命令层：tab 补全", () => {
-	it("空前缀：stop/status + tmp 下 .md/.txt 文件，排除其他扩展名", async () => {
+describe("command layer: tab completion", () => {
+	it("empty prefix: stop/status + .md/.txt files in tmp, other extensions excluded", async () => {
 		const { world, cmd } = await setup();
 		fs.writeFileSync(path.join(world.tmp, "notes.txt"), "x", "utf-8");
 		fs.writeFileSync(path.join(world.tmp, "image.png"), "x", "utf-8");
@@ -496,7 +508,7 @@ describe("命令层：tab 补全", () => {
 		spy.mockRestore();
 	});
 
-	it('"st" → 仅 stop/status', async () => {
+	it('"st" → only stop/status', async () => {
 		const { world, cmd } = await setup();
 		const spy = vi.spyOn(process, "cwd").mockReturnValue(world.tmp);
 		const items = cmd.getArgumentCompletions!("st") ?? [];
@@ -504,14 +516,14 @@ describe("命令层：tab 补全", () => {
 		spy.mockRestore();
 	});
 
-	it('"zzz" → null（无候选项）', async () => {
+	it('"zzz" → null (no candidates)', async () => {
 		const { cmd } = await setup();
 		const spy = vi.spyOn(process, "cwd").mockReturnValue("/nonexistent-pi-batch-test");
 		expect(cmd.getArgumentCompletions!("zzz")).toBeNull();
 		spy.mockRestore();
 	});
 
-	it("含空格文件名：补全值加双引号（与 tokenizeArgs 引号语义一致）；已输入开引号时匹配并闭合", async () => {
+	it("file names with spaces: completion value gets double quotes (matching tokenizeArgs); typed opening quote matches and closes", async () => {
 		const { world, cmd } = await setup();
 		fs.writeFileSync(path.join(world.tmp, "my tasks.md"), "x", "utf-8");
 		const spy = vi.spyOn(process, "cwd").mockReturnValue(world.tmp);
@@ -526,11 +538,11 @@ describe("命令层：tab 补全", () => {
 });
 
 // ============================================================================
-// 正常执行与产物
+// Normal execution and artifacts
 // ============================================================================
 
-describe("命令层：正常执行与产物", () => {
-	it("2 个 continue 任务全部成功：send 选项 / report / progress 改名 / 状态栏清理", async () => {
+describe("command layer: normal execution and artifacts", () => {
+	it("2 continue tasks all succeed: send options / report / progress rename / status-bar cleanup", async () => {
 		const { world, cmd, ctx } = await setup();
 		await cmd.handler("list.md", ctx);
 
@@ -548,7 +560,7 @@ describe("命令层：正常执行与产物", () => {
 		expect(summary.type).toBe("info");
 	});
 
-	it("--start 2：任务 1 标记 skipped，其余执行", async () => {
+	it("--start 2: task 1 marked skipped, the rest execute", async () => {
 		const { world, cmd, ctx } = await setup();
 		writeManifest(world, "list.md", THREE_CONTINUE);
 		await cmd.handler("list.md --start 2", ctx);
@@ -559,7 +571,7 @@ describe("命令层：正常执行与产物", () => {
 		expect(world.sent.map((s) => s.content)).toEqual(["正文二", "正文三"]);
 	});
 
-	it("CLI 配置落盘：--retries 2 --on-exhaust abort", async () => {
+	it("CLI options persist: --retries 2 --on-exhaust abort", async () => {
 		const { world, cmd, ctx } = await setup();
 		await cmd.handler("list.md --retries 2 --on-exhaust abort", ctx);
 		const done = readDone(world);
@@ -567,22 +579,23 @@ describe("命令层：正常执行与产物", () => {
 		expect(done.onExhaust).toBe("abort");
 	});
 
-	it("带 name: 的 new 任务 → newSession 收到 name 且 setup 写入会话名", async () => {
+	it("a new task with name: → newSession receives the name and setup writes the session name", async () => {
 		const { world, cmd, ctx } = await setup();
-		writeManifest(world, "list.md", "---\n[新会话]\nname: 专项A\n标题A\n正文A\n---\n[继续] 跟进\n正文B\n");
+		writeManifest(world, "list.md", "---\n[new]\nname: 专项A\n标题A\n正文A\n---\n[continue] 跟进\n正文B\n");
 		await cmd.handler("list.md", ctx);
 
-		// adaptCtx 把 name 转换为 setup 闭包：原始 ctx.newSession 收不到 name 字段，
-		// 名字唯一通道是 setup → appendSessionInfo（钉住接线方式）
+		// adaptCtx converts name into a setup closure: the raw ctx.newSession
+		// never sees a name field — the only channel is setup →
+		// appendSessionInfo (pins the wiring).
 		expect(world.newSessionCalls).toEqual([{ name: undefined, hasSetup: true }]);
 		expect(world.appendSessionNames).toEqual(["专项A"]);
 		expect(world.childSessions[0]!.sends).toEqual(["正文A", "正文B"]);
 		expect(readDone(world).tasks.map((t: any) => t.status)).toEqual(["ok", "ok"]);
 	});
 
-	it("不带 name 的 new 任务 → 不命名（无 setup）", async () => {
+	it("a new task without name → unnamed (no setup)", async () => {
 		const { world, cmd, ctx } = await setup();
-		writeManifest(world, "list.md", "---\n[新会话] 无名任务\n正文\n");
+		writeManifest(world, "list.md", "---\n[new] 无名任务\n正文\n");
 		await cmd.handler("list.md", ctx);
 
 		expect(world.newSessionCalls).toEqual([{ name: undefined, hasSetup: false }]);
@@ -592,11 +605,11 @@ describe("命令层：正常执行与产物", () => {
 });
 
 // ============================================================================
-// 断点续跑
+// Resume from breakpoint
 // ============================================================================
 
-describe("命令层：断点续跑", () => {
-	it("选择「取消」→ 已取消、零 send、progress 不动", async () => {
+describe("command layer: resume from breakpoint", () => {
+	it("choosing cancel → cancelled, zero sends, progress untouched", async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["取消"] });
 		writeProgress(world, [savedTask(1, "new", "ok"), savedTask(2, "continue", "pending")]);
 		await cmd.handler("list.md", ctx);
@@ -607,7 +620,7 @@ describe("命令层：断点续跑", () => {
 		expect(fs.existsSync(donePath(world))).toBe(false);
 	});
 
-	it("选择「从头重新开始」→ 旧 done 备份 .bak，全部任务重跑", async () => {
+	it("choosing restart → old .done backed up as .bak, all tasks rerun", async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从头重新开始"] });
 		fs.writeFileSync(donePath(world), "old", "utf-8");
 		writeProgress(world, [savedTask(1, "new", "ok"), savedTask(2, "continue", "pending")]);
@@ -618,13 +631,9 @@ describe("命令层：断点续跑", () => {
 		expect(readDone(world).tasks.map((t: any) => t.status)).toEqual(["ok", "ok"]);
 	});
 
-	it("选择「从断点继续」但清单任务数不一致 → 报错不执行", async () => {
+	it("choosing resume but task counts mismatch → error, nothing executes", async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
-		writeProgress(world, [
-			savedTask(1, "new", "ok"),
-			savedTask(2, "continue", "ok"),
-			savedTask(3, "continue", "pending"),
-		]);
+		writeProgress(world, [savedTask(1, "new", "ok"), savedTask(2, "continue", "ok"), savedTask(3, "continue", "pending")]);
 		await cmd.handler("list.md", ctx);
 
 		expect(lastNotify(world).type).toBe("error");
@@ -632,9 +641,9 @@ describe("命令层：断点续跑", () => {
 		expect(world.sent).toHaveLength(0);
 	});
 
-	it("断点为「新会话」任务 → 直接从该任务继续", async () => {
+	it('breakpoint on a "new" task → continues directly from that task', async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
-		writeManifest(world, "list.md", "---\n[新会话] 任务一\n正文一\n---\n[新会话] 任务二\n正文二\n");
+		writeManifest(world, "list.md", "---\n[new] 任务一\n正文一\n---\n[new] 任务二\n正文二\n");
 		writeProgress(world, [savedTask(1, "new", "ok"), savedTask(2, "new", "pending")]);
 		await cmd.handler("list.md", ctx);
 
@@ -644,7 +653,7 @@ describe("命令层：断点续跑", () => {
 		expect(readDone(world).tasks.map((t: any) => t.status)).toEqual(["ok", "ok"]);
 	});
 
-	it("断点为「继续」任务且前置会话文件存在 → switchSession 找回会话", async () => {
+	it('breakpoint on a "continue" task with the previous session file present → switchSession restores it', async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
 		const prevSession = path.join(world.tmp, "prev.jsonl");
 		fs.writeFileSync(prevSession, "{}", "utf-8");
@@ -657,7 +666,7 @@ describe("命令层：断点续跑", () => {
 		expect(readDone(world).tasks[1]).toMatchObject({ status: "ok", sessionFile: prevSession });
 	});
 
-	it("前置会话文件丢失 → warning 降级为新会话执行", async () => {
+	it("previous session file missing → warning and fallback to a fresh session", async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
 		writeProgress(world, [
 			savedTask(1, "new", "ok", { sessionFile: path.join(world.tmp, "missing.jsonl") }),
@@ -671,28 +680,24 @@ describe("命令层：断点续跑", () => {
 		expect(readDone(world).tasks[1]!.status).toBe("ok");
 	});
 
-	it("断点任务停留 running → 重置后执行成功；计数在首次开始时重置（钉住现状）", async () => {
+	it("breakpoint task left running → resets then succeeds; counters reset on first start (pinned)", async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
 		const prevSession = path.join(world.tmp, "prev.jsonl");
 		fs.writeFileSync(prevSession, "{}", "utf-8");
-		writeProgress(world, [
-			savedTask(1, "new", "ok", { sessionFile: prevSession }),
-			savedTask(2, "continue", "running", { attempts: 2 }),
-		]);
+		writeProgress(world, [savedTask(1, "new", "ok", { sessionFile: prevSession }), savedTask(2, "continue", "running", { attempts: 2 })]);
 		await cmd.handler("list.md", ctx);
 
 		expect(readDone(world).tasks[1]).toMatchObject({ status: "ok", attempts: 1 });
 	});
 
-	it("续跑时显式 --retries/--on-exhaust 覆盖上次配置并提示", async () => {
+	it("explicit --retries/--on-exhaust on resume override the saved config and say so", async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
 		const prevSession = path.join(world.tmp, "prev.jsonl");
 		fs.writeFileSync(prevSession, "{}", "utf-8");
-		writeProgress(
-			world,
-			[savedTask(1, "new", "ok", { sessionFile: prevSession }), savedTask(2, "continue", "pending")],
-			{ retries: 5, onExhaust: "abort" },
-		);
+		writeProgress(world, [savedTask(1, "new", "ok", { sessionFile: prevSession }), savedTask(2, "continue", "pending")], {
+			retries: 5,
+			onExhaust: "abort",
+		});
 		await cmd.handler("list.md --retries 0 --on-exhaust skip", ctx);
 
 		expect(readDone(world).retries).toBe(0);
@@ -701,15 +706,14 @@ describe("命令层：断点续跑", () => {
 		expect(world.notifies.some((n) => n.message.includes("--on-exhaust=skip"))).toBe(true);
 	});
 
-	it("续跑未显式传配置项时沿用上次配置（不静默回退默认值、不提示）", async () => {
+	it("resume without explicit options keeps the saved config (no silent fallback to defaults, no notice)", async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
 		const prevSession = path.join(world.tmp, "prev.jsonl");
 		fs.writeFileSync(prevSession, "{}", "utf-8");
-		writeProgress(
-			world,
-			[savedTask(1, "new", "ok", { sessionFile: prevSession }), savedTask(2, "continue", "pending")],
-			{ retries: 5, onExhaust: "abort" },
-		);
+		writeProgress(world, [savedTask(1, "new", "ok", { sessionFile: prevSession }), savedTask(2, "continue", "pending")], {
+			retries: 5,
+			onExhaust: "abort",
+		});
 		await cmd.handler("list.md", ctx);
 
 		expect(readDone(world).retries).toBe(5);
@@ -717,7 +721,7 @@ describe("命令层：断点续跑", () => {
 		expect(world.notifies.some((n) => n.message.includes("断点续跑："))).toBe(false);
 	});
 
-	it("续跑时 --start 被忽略并提示（起点由断点决定）", async () => {
+	it("--start is ignored on resume with a notice (the breakpoint decides the start)", async () => {
 		const { world, cmd, ctx } = await setup({ selectResponses: ["从断点继续"] });
 		const prevSession = path.join(world.tmp, "prev.jsonl");
 		fs.writeFileSync(prevSession, "{}", "utf-8");
@@ -725,17 +729,17 @@ describe("命令层：断点续跑", () => {
 		await cmd.handler("list.md --start 2", ctx);
 
 		expect(world.notifies.some((n) => n.message.includes("--start 已忽略"))).toBe(true);
-		// 仍从断点（任务 2）执行
+		// Still resumes from the breakpoint (task 2).
 		expect(world.sent.map((s) => s.content)).toEqual(["正文二"]);
 	});
 });
 
 // ============================================================================
-// 运行中干预（编排类：holdSettle 手动结算推进）
+// Runtime intervention (orchestration: holdSettle with manual settling)
 // ============================================================================
 
-describe("命令层：运行中干预（编排）", () => {
-	it("批次运行中二次 /batch 被拒绝；原批次继续完成", async () => {
+describe("command layer: runtime intervention (orchestration)", () => {
+	it("a second /batch while running is rejected; the original batch finishes", async () => {
 		const { world, cmd, ctx } = await setup({ holdSettle: true });
 		const first = cmd.handler("list.md", ctx);
 		await vi.waitFor(() => expect(world.sent).toHaveLength(1), { timeout: 5_000 });
@@ -751,7 +755,7 @@ describe("命令层：运行中干预（编排）", () => {
 		expect(readDone(world).tasks.map((t: any) => t.status)).toEqual(["ok", "ok"]);
 	}, 15_000);
 
-	it("/batch stop：当前任务自然结束后停止（不再推进）", async () => {
+	it("/batch stop: stops after the current task ends naturally (no further advancing)", async () => {
 		const { world, cmd, ctx } = await setup({ holdSettle: true });
 		const first = cmd.handler("list.md", ctx);
 		await vi.waitFor(() => expect(world.sent).toHaveLength(1), { timeout: 5_000 });
@@ -768,7 +772,7 @@ describe("命令层：运行中干预（编排）", () => {
 		expect(world.notifies.some((n) => n.message.includes("未执行 1"))).toBe(true);
 	}, 15_000);
 
-	it("/batch stop --now：中止当前任务并终止整批", async () => {
+	it("/batch stop --now: aborts the current task and terminates the batch", async () => {
 		const { world, cmd, ctx } = await setup({ holdSettle: true });
 		const first = cmd.handler("list.md", ctx);
 		await vi.waitFor(() => expect(world.sent).toHaveLength(1), { timeout: 5_000 });

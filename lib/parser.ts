@@ -1,61 +1,71 @@
 /**
- * 清单文件解析。
+ * Manifest file parsing.
  *
- * 格式规范（PLAN 第 4 节）：
- * - 以单独一行 `---`（前后允许空白）分隔任务条目；首个 `---` 之前的内容全部忽略；
- * - 条目第一行若匹配 ^[(新会话|new)] 或 ^[(继续|continue)]（大小写不敏感）则为模式标记行；
- *   无标记时默认「新会话」；
- * - 标记行中标记之后的非空文本 = 任务标题；无标记时条目第一行非空文本 = 标题；
- *   其余非空行为提示词正文；条目只有一行时标题 = 正文首行；
- * - 裸标记行（标记后无标题）之后、标题行之前，允许出现保留字段行 `key: value`：
- *   `name` 已实现语义（显式会话命名，仅「新会话」裸标记条目；「继续」任务带 name 或值为空报错，
- *   重复 name 以最后一个为准），其余键仅为未来扩展预留，识别后忽略；
- *   标题已确定后出现的 `key: value` 行一律视为正文，避免误吞普通文本；
- * - 提示词正文中的空行保留，整体 trim 首尾；
- * - 行尾兼容 CRLF/LF；解析结果为 0 个任务时报错。
+ * Format spec (PLAN section 4):
+ * - Entries are separated by a lone `---` line (surrounding whitespace allowed);
+ *   everything before the first `---` is ignored (may hold batch notes);
+ * - If an entry's first line matches ^[new] or ^[continue] (case-insensitive)
+ *   it is a mode-marker line; without a marker the default mode is "new";
+ *   Chinese markers ([新会话] / [继续]) are NOT recognized — such text is kept
+ *   verbatim as (part of) the title;
+ * - Non-empty text after the marker = task title; without a marker, the first
+ *   non-empty line = title; remaining non-empty lines = prompt body; when an
+ *   entry is a single line, the title doubles as the prompt;
+ * - After a bare marker line (marker with no title) and before the title line,
+ *   reserved `key: value` field lines are allowed: `name` has semantics
+ *   (explicit session naming, only for bare-marker "new" entries; a `name` on a
+ *   "continue" task or an empty value is an error; the last `name` wins). All
+ *   other keys are reserved for future extension and ignored. `key: value` lines
+ *   appearing after the title is decided are treated as prompt body, so regular
+ *   text is never swallowed;
+ * - Blank lines in the prompt body are preserved; the body is trimmed at both
+ *   ends; CRLF/LF both work; zero parsed tasks is an error.
  */
 
 import { ManifestParseError, type BatchTask, type TaskMode } from "./types.ts";
 
 export { ManifestParseError };
 
-/** v1 保留字段：仅出现在「裸标记行之后、标题行之前」时被忽略 */
+/** v1 reserved fields: ignored only between a bare marker line and the title line. */
 const RESERVED_FIELD_KEYS = new Set(["model", "timeout", "retries", "max-turns", "on-exhaust"]);
 
-const MARKER_RE = /^\s*\[(新会话|new|继续|continue)\]\s*(.*)$/i;
+const MARKER_RE = /^\s*\[(new|continue)\]\s*(.*)$/i;
 const FIELD_LINE_RE = /^([a-z][a-z0-9_-]*):\s*(.*)$/;
 const SEPARATOR_RE = /^\s*---\s*$/;
 
-/** 从标记原文归一化任务模式 */
+/** Normalizes a raw marker into the task mode (English-only markers, case-insensitive). */
 function normalizeMode(marker: string): TaskMode {
-	const m = marker.toLowerCase();
-	if (m === "新会话" || m === "new") return "new";
-	return "continue";
+	return marker.toLowerCase() === "new" ? "new" : "continue";
 }
 
-/** 解析清单文本，返回任务列表；0 个任务时抛出 ManifestParseError */
+/**
+ * Parses manifest text into a task list.
+ *
+ * @returns Parsed tasks in manifest order.
+ * @throws {@link ManifestParseError} when no task is found or an entry is invalid.
+ */
 export function parseManifest(content: string): BatchTask[] {
 	const normalized = content.replace(/\r\n?/g, "\n");
 	const lines = normalized.split("\n");
 
-	// 首个 --- 之前的内容全部忽略
+	// Everything before the first `---` is ignored.
 	let i = 0;
 	while (i < lines.length && !SEPARATOR_RE.test(lines[i] ?? "")) i++;
-	// 跳过首个 --- 本身
+	// Skip the `---` line itself.
 	i++;
 
 	const tasks: BatchTask[] = [];
 
 	while (i < lines.length) {
-		// 收集一个条目（到下一个 --- 或文件结束）
+		// Collect one entry (up to the next `---` or end of file).
 		const entryLines: string[] = [];
 		while (i < lines.length && !SEPARATOR_RE.test(lines[i] ?? "")) {
 			entryLines.push(lines[i] ?? "");
 			i++;
 		}
-		i++; // 跳过分隔符
+		i++; // Skip the separator.
 
-		if (entryLines.join("").trim() === "") continue; // 空条目跳过
+		if (entryLines.join("").trim() === "") continue; // Skip empty entries.
 
 		const task = parseEntry(entryLines, tasks.length + 1);
 		if (task) tasks.push(task);
@@ -67,14 +77,14 @@ export function parseManifest(content: string): BatchTask[] {
 	return tasks;
 }
 
-/** 解析单个条目；内容为空时返回 undefined（调用方已过滤空条目，防御性保留） */
+/** Parses a single entry; returns undefined for empty content (callers already filter empties; kept defensively). */
 function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | undefined {
 	let mode: TaskMode = "new";
 	let explicitTitle = "";
 	let sessionName: string | undefined;
 	let cursor = 0;
 
-	// (1) 模式标记行（可选）
+	// (1) Optional mode-marker line.
 	const first = entryLines[0] ?? "";
 	const markerMatch = MARKER_RE.exec(first);
 	if (markerMatch) {
@@ -82,7 +92,7 @@ function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | un
 		explicitTitle = (markerMatch[2] ?? "").trim();
 		cursor = 1;
 
-		// (2) 裸标记行：允许在未来扩展字段行出现后再确定标题
+		// (2) Bare marker line: the title may come after future reserved-field lines.
 		if (explicitTitle === "") {
 			while (cursor < entryLines.length) {
 				const line = (entryLines[cursor] ?? "").trim();
@@ -92,7 +102,7 @@ function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | un
 				}
 				const fieldMatch = FIELD_LINE_RE.exec(line);
 				if (fieldMatch && RESERVED_FIELD_KEYS.has(fieldMatch[1] ?? "")) {
-					cursor++; // 保留字段：忽略
+					cursor++; // Reserved field: ignore.
 					continue;
 				}
 				if (fieldMatch && fieldMatch[1] === "name") {
@@ -100,11 +110,11 @@ function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | un
 					if (value === "") {
 						throw new ManifestParseError(`任务 ${oneBasedIndex}：name 字段值不能为空`, oneBasedIndex);
 					}
-					sessionName = value; // 重复 name: 以最后一个为准
+					sessionName = value; // Repeated `name:`: the last one wins.
 					cursor++;
 					continue;
 				}
-				break; // 第一行非字段文本 = 标题
+				break; // First non-field line = title.
 			}
 			if (sessionName !== undefined && mode === "continue") {
 				throw new ManifestParseError(`任务 ${oneBasedIndex}：name 字段仅对「新会话」任务有效`, oneBasedIndex);
@@ -115,7 +125,7 @@ function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | un
 			}
 		}
 	} else {
-		// (3) 无标记：第一行非空文本 = 标题
+		// (3) No marker: first non-empty line = title.
 		while (cursor < entryLines.length && (entryLines[cursor] ?? "").trim() === "") cursor++;
 		if (cursor < entryLines.length) {
 			explicitTitle = (entryLines[cursor] ?? "").trim();
@@ -123,23 +133,19 @@ function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | un
 		}
 	}
 
-	// (4) 剩余行为正文
-	const body = entryLines
-		.slice(cursor)
-		.join("\n")
-		.replace(/^\n+/, "")
-		.replace(/\n+$/, "")
-		.trim();
+	// (4) Remaining lines = prompt body.
+	const body = entryLines.slice(cursor).join("\n").replace(/^\n+/, "").replace(/\n+$/, "").trim();
 
 	if (explicitTitle === "" && body === "") {
-		// 有标记但无任何内容：空条目是明确的书写错误，报错而非静默跳过
+		// A marker with no content at all is an explicit writing mistake:
+		// raise instead of silently skipping.
 		if (markerMatch) {
 			throw new ManifestParseError(`任务 ${oneBasedIndex} 提示词正文为空`, oneBasedIndex);
 		}
 		return undefined;
 	}
 
-	// 标题回退：条目只有一行时，标题 = 正文首行（该行同时作为提示词）
+	// Title fallback: single-line entries use the first body line as both title and prompt.
 	let title: string;
 	let prompt: string;
 	if (explicitTitle !== "") {
@@ -157,12 +163,20 @@ function parseEntry(entryLines: string[], oneBasedIndex: number): BatchTask | un
 	return { index: oneBasedIndex, mode, title, name: sessionName, prompt };
 }
 
+/** Returns the first line of `text`, trimmed. */
 function firstLineOf(text: string): string {
 	const idx = text.indexOf("\n");
 	return (idx === -1 ? text : text.slice(0, idx)).trim();
 }
 
-/** 解析参数切分：支持双引号包裹含空格路径 */
+/**
+ * Splits raw command arguments into tokens.
+ *
+ * Double quotes group a path containing spaces into a single token.
+ *
+ * @example
+ * tokenizeArgs('"my tasks.md" --dry-run'); // => ["my tasks.md", "--dry-run"]
+ */
 export function tokenizeArgs(raw: string): string[] {
 	const tokens: string[] = [];
 	const re = /"([^"]*)"|(\S+)/g;

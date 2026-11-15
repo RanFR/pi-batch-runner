@@ -1,32 +1,27 @@
 /**
- * 执行引擎单元测试：手写 fake 驱动（不依赖真实 pi 进程 / 真实模型）。
+ * Executor unit tests: hand-written fakes (no real pi process / real model).
  *
- * fake 语义：
- * - 根会话 send 返回 void（对应 pi.sendUserMessage）；新会话/切换目标的 send 返回
- *   Promise 且在 settle 时 resolve（对应 ReplacedSessionContext.sendUserMessage）；
- * - 任务结果由 outcomes 队列驱动："ok" | "error" | "aborted" | "noshow"（发送后永远不 settle，
- *   用于发送失败看门狗）| "silent"（运行正常发生但不经 bus 发布 settled，模拟事件桥断裂）；
- * - sleep 为真实 macrotask 让位 + 虚拟时钟推进，保证 settled 定时器有机会先执行。
+ * Fake semantics:
+ * - Root-session send returns void (pi.sendUserMessage); sends on fresh/
+ *   switched sessions return a Promise that resolves on settle
+ *   (ReplacedSessionContext.sendUserMessage);
+ * - Task results are driven by an outcomes queue: "ok" | "error" | "aborted" |
+ *   "noshow" (never settles after send, for the send-failure watchdog) |
+ *   "silent" (the run happens normally but settled is never published on the
+ *   bus, modeling a broken event bridge);
+ * - sleep yields a real macrotask while advancing a virtual clock, so settled
+ *   timers get a chance to run first.
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { startBatch, createStopHandle, lastAssistantMessage, type StartPoint, type StopHandle } from "../lib/executor.ts";
-import type {
-	BatchContext,
-	BatchLeg,
-	BatchState,
-	BranchEntryView,
-	EngineDeps,
-	OnExhaust,
-	SettledBus,
-	TaskMode,
-} from "../lib/types.ts";
+import type { BatchContext, BatchLeg, BatchState, BranchEntryView, EngineDeps, OnExhaust, SettledBus, TaskMode } from "../lib/types.ts";
 
 // ============================================================================
-// fake 基础设施
+// Fake infrastructure
 // ============================================================================
 
 type Outcome = "ok" | "error" | "aborted" | "noshow" | "reject" | "silent";
@@ -51,7 +46,7 @@ interface FakeSession {
 	newSessionCalls: number;
 	newSessionNames: Array<string | undefined>;
 	switchCalls: string[];
-	/** send 是否返回 Promise（fresh 上下文行为） */
+	/** Whether send returns a Promise (fresh-context behavior). */
 	returnsPromise: boolean;
 	resolvers: Array<() => void>;
 	leg: BatchLeg;
@@ -193,7 +188,7 @@ function makeHarness(opts?: {
 				hasPendingMessages: () => session.pending > 0,
 				waitForIdle: async () => {
 					if (harness.throwOnWait) throw new Error("wait boom");
-					if (!harness.neverDrain) session.pending = 0; // 空闲即队列已消化
+					if (!harness.neverDrain) session.pending = 0; // idle means the queue has drained
 					while (!session.idle) await tick();
 				},
 				abort: () => {
@@ -229,12 +224,13 @@ function makeHarness(opts?: {
 				harness.onSend?.(session, content);
 				const outcome = harness.outcomes.length > 0 ? harness.outcomes.shift()! : "ok";
 				if (outcome === "noshow") {
-					// 发送被接受但运行永远不启动：保持 idle
-					return session.returnsPromise ? new Promise<void>(() => { }) : undefined;
+					// Send accepted but the run never starts: stay idle.
+					return session.returnsPromise ? new Promise<void>(() => {}) : undefined;
 				}
 				if (outcome === "silent") {
-					// 运行正常发生（分支推进、idle 翻转、send promise resolve），
-					// 但不经 bus 发布 agent_settled（模拟 /reload 后事件桥断裂）
+					// The run happens normally (branch advances, idle flips, send
+					// promise resolves) but agent_settled is never published on the
+					// bus (models a broken event bridge after /reload).
 					session.idle = false;
 					const p = new Promise<void>((resolve) => {
 						session.resolvers.push(() => resolve());
@@ -250,7 +246,7 @@ function makeHarness(opts?: {
 					return session.returnsPromise ? p : undefined;
 				}
 				if (outcome === "reject") {
-					// send promise 直接拒绝（对应 ReplacedSessionContext.sendUserMessage 失败路径）
+					// Send promise rejects outright (ReplacedSessionContext.sendUserMessage failure path).
 					return session.returnsPromise ? Promise.reject(new Error("send boom")) : undefined;
 				}
 				session.idle = false;
@@ -303,7 +299,7 @@ function makeDeps(h: Harness): EngineDeps {
 		now: () => h.vnow,
 		sleep: async (ms: number) => {
 			h.vnow += Math.max(ms, 250);
-			await tick(); // 让位 macrotask，settle 定时器得以执行
+			await tick(); // Yield to macrotasks so settle timers can run.
 		},
 		sendFailTimeoutMs: h.sendFailTimeoutMs,
 		sendFailVoidGraceMs: h.sendFailVoidGraceMs,
@@ -313,24 +309,20 @@ function makeDeps(h: Harness): EngineDeps {
 	};
 }
 
-async function run(
-	h: Harness,
-	state: BatchState,
-	start: StartPoint = { kind: "direct", index: 0 },
-): Promise<void> {
+async function run(h: Harness, state: BatchState, start: StartPoint = { kind: "direct", index: 0 }): Promise<void> {
 	await startBatch(makeDeps(h), h.root.leg, state, start, h.stop);
 }
 
 afterEach(() => {
-	// 无跨用例状态
+	// No state shared across tests.
 });
 
 // ============================================================================
-// 用例
+// Tests
 // ============================================================================
 
-describe("executor：顺序执行与推进", () => {
-	it("同会话连续任务顺序执行并全部成功", async () => {
+describe("executor: sequential execution and advancing", () => {
+	it("consecutive tasks in one session run in order and all succeed", async () => {
 		const { harness: h, state, tmp } = makeHarness({ outcomes: ["ok", "ok", "ok"] });
 		addTasks(state, [
 			["continue", "任务一"],
@@ -343,18 +335,18 @@ describe("executor：顺序执行与推进", () => {
 		expect(h.root.sends).toEqual(["prompt-1-任务一", "prompt-2-任务二", "prompt-3-任务三"]);
 		expect(state.tasks.map((t) => t.status)).toEqual(["ok", "ok", "ok"]);
 		expect(h.batchEnded).toBe(1);
-		// 汇总产物
+		// Summary artifacts.
 		expect(fs.existsSync(path.join(tmp, "list.md.progress.json"))).toBe(false);
 		expect(fs.existsSync(path.join(tmp, "list.md.progress.json.done"))).toBe(true);
 		expect(fs.existsSync(path.join(tmp, "list.md.report.md"))).toBe(true);
 		const report = fs.readFileSync(path.join(tmp, "list.md.report.md"), "utf-8");
 		expect(report).toContain("任务一");
-		// widget 已设置且状态栏已清除（最后一个 setStatus 为 undefined）
+		// Widget set and status bar cleared (last setStatus is undefined).
 		expect(h.widgets.length).toBeGreaterThan(0);
 		expect(h.statuses[h.statuses.length - 1]).toBeUndefined();
 	});
 
-	it("「继续」任务不触发 newSession，「新会话」任务经 withSession 回调使用 fresh leg", async () => {
+	it("continue tasks do not trigger newSession; new tasks use the fresh leg from the withSession callback", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok", "ok", "ok", "ok"] });
 		addTasks(state, [
 			["new", "任务一"],
@@ -368,9 +360,9 @@ describe("executor：顺序执行与推进", () => {
 		expect(h.root.newSessionCalls).toBe(1);
 		const child = h.root.children[0]!;
 		expect(child.newSessionCalls).toBe(1);
-		// 任务一在 child，任务二/三在 grandchild，任务四在 great-grandchild
+		// Task 1 runs in child; tasks 2/3 in grandchild; task 4 in great-grandchild.
 		expect(child.sends).toEqual(["prompt-1-任务一"]);
-		// 未指定 name：newSession 不带 name（不命名）；日志为裸 newSession
+		// No name given: newSession without a name (unnamed); log shows a bare newSession.
 		expect(h.root.newSessionNames[0]).toBeUndefined();
 		expect(h.log).toContain("newSession");
 		const grand = child.children[0]!;
@@ -378,12 +370,12 @@ describe("executor：顺序执行与推进", () => {
 		const great = grand.children[0]!;
 		expect(great.sends).toEqual(["prompt-4-任务四"]);
 		expect(state.tasks.every((t) => t.status === "ok")).toBe(true);
-		// 会话文件随 leg 记录
+		// Session files are recorded per leg.
 		expect(state.tasks[0]!.sessionFile).toBe(child.sessionFile);
 		expect(state.tasks[2]!.sessionFile).toBe(grand.sessionFile);
 	});
 
-	it("「新会话」任务带显式 name 时精确透传给 newSession（不再拼接自动名）", async () => {
+	it("a new task with an explicit name is passed verbatim to newSession (no auto-generated name)", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok", "ok"] });
 		addTasks(state, [
 			["new", "任务一", "数据导入重构"],
@@ -394,12 +386,12 @@ describe("executor：顺序执行与推进", () => {
 
 		expect(h.root.newSessionNames[0]).toBe("数据导入重构");
 		expect(h.log).toContain("newSession:数据导入重构");
-		// 自动命名模板（批次名 · 任务N 标题）不再出现
+		// The auto-naming template (批次名 · 任务N 标题) no longer appears.
 		expect(h.log.every((l) => !l.includes(" · 任务"))).toBe(true);
 		expect(state.tasks.every((t) => t.status === "ok")).toBe(true);
 	});
 
-	it("断点续跑 fresh 起点同样透传显式 name", async () => {
+	it("a fresh resume start point also passes an explicit name through", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok"] });
 		addTasks(state, [["new", "恢复的任务", "恢复会话名"]]);
 
@@ -409,7 +401,7 @@ describe("executor：顺序执行与推进", () => {
 		expect(state.tasks[0]!.status).toBe("ok");
 	});
 
-	it("首条任务为「继续」时在当前会话执行（不 newSession）", async () => {
+	it("a first task marked continue runs in the current session (no newSession)", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok"] });
 		addTasks(state, [["continue", "接着手工会话跑"]]);
 
@@ -420,7 +412,7 @@ describe("executor：顺序执行与推进", () => {
 		expect(state.tasks[0]!.status).toBe("ok");
 	});
 
-	it("订阅先于发送（settled 竞态防护）", async () => {
+	it("subscribes before sending (settled race protection)", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok", "ok"] });
 		addTasks(state, [
 			["continue", "A"],
@@ -433,7 +425,7 @@ describe("executor：顺序执行与推进", () => {
 		const firstSend = h.log.findIndex((l) => l.startsWith("send:"));
 		expect(firstSub).toBeGreaterThanOrEqual(0);
 		expect(firstSend).toBeGreaterThan(firstSub);
-		// 每次尝试前都重新挂一次性订阅（第二次 send 之前有第二次 subscribe）
+		// Each attempt re-subscribes before sending (a second subscribe precedes the second send).
 		const secondSend = h.log.findIndex((l, i) => i > firstSend && l.startsWith("send:"));
 		const secondSub = h.log.indexOf("subscribe", firstSub + 1);
 		expect(secondSub).toBeGreaterThan(-1);
@@ -441,8 +433,8 @@ describe("executor：顺序执行与推进", () => {
 	});
 });
 
-describe("executor：失败重试与耗尽", () => {
-	it("error → 自动重试 → 成功；重试通知为 warning", async () => {
+describe("executor: failure retries and exhaustion", () => {
+	it("error → auto retry → success; retry notices are warnings", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["error", "error", "ok"], retries: 3 });
 		addTasks(state, [["continue", "易失败任务"]]);
 
@@ -455,7 +447,7 @@ describe("executor：失败重试与耗尽", () => {
 		expect(warnings[0]!.message).toContain("第 1/4 次");
 	});
 
-	it("重试耗尽 + onExhaust=skip：记录失败并继续下一条（不弹选择框）", async () => {
+	it("exhausted retries + onExhaust=skip: records the failure and moves on (no dialog)", async () => {
 		const { harness: h, state } = makeHarness({
 			outcomes: ["error", "error", "ok", "ok"],
 			retries: 1,
@@ -474,7 +466,7 @@ describe("executor：失败重试与耗尽", () => {
 		expect(state.tasks[1]!.status).toBe("ok");
 	});
 
-	it("重试耗尽 + onExhaust=abort：终止整批", async () => {
+	it("exhausted retries + onExhaust=abort: terminates the whole batch", async () => {
 		const { harness: h, state } = makeHarness({
 			outcomes: ["error", "error", "ok"],
 			retries: 1,
@@ -487,13 +479,13 @@ describe("executor：失败重试与耗尽", () => {
 
 		await run(h, state);
 
-		expect(h.root.sends).toHaveLength(2); // 只重试一次，不运行任务 2
+		expect(h.root.sends).toHaveLength(2); // One retry only; task 2 never runs.
 		expect(state.tasks[0]!.status).toBe("failed");
 		expect(state.tasks[1]!.status).toBe("pending");
 	});
 
-	it("重试耗尽 + onExhaust=pause：选择框三条路径", async () => {
-		// 路径 1：跳过
+	it("exhausted retries + onExhaust=pause: all three dialog paths", async () => {
+		// Path 1: skip.
 		{
 			const { harness: h, state } = makeHarness({
 				outcomes: ["error", "error", "ok"],
@@ -510,7 +502,7 @@ describe("executor：失败重试与耗尽", () => {
 			expect(state.tasks[0]!.status).toBe("failed");
 			expect(state.tasks[1]!.status).toBe("ok");
 		}
-		// 路径 2：重试本条（计数累计）后再挂 → 再次询问 → 跳过
+		// Path 2: retry in place (attempts accumulate), fail again → asked again → skip.
 		{
 			const { harness: h, state } = makeHarness({
 				outcomes: ["error", "error", "error"],
@@ -523,7 +515,7 @@ describe("executor：失败重试与耗尽", () => {
 			expect(h.selects).toHaveLength(2);
 			expect(state.tasks[0]).toMatchObject({ status: "failed", attempts: 3 });
 		}
-		// 路径 3：终止整批
+		// Path 3: terminate the batch.
 		{
 			const { harness: h, state } = makeHarness({
 				outcomes: ["error", "error", "ok"],
@@ -538,7 +530,7 @@ describe("executor：失败重试与耗尽", () => {
 			await run(h, state);
 			expect(state.tasks[1]!.status).toBe("pending");
 		}
-		// 路径 4：选择框被关闭（undefined）→ 终止
+		// Path 4: dialog dismissed (undefined) → terminate.
 		{
 			const { harness: h, state } = makeHarness({
 				outcomes: ["error", "error"],
@@ -554,8 +546,8 @@ describe("executor：失败重试与耗尽", () => {
 	});
 });
 
-describe("executor：中断（Esc）与停止", () => {
-	it("aborted → 选择「跳过」继续", async () => {
+describe("executor: interruption (Esc) and stopping", () => {
+	it("aborted → choosing skip continues", async () => {
 		const { harness: h, state } = makeHarness({
 			outcomes: ["aborted", "ok"],
 			selectResponses: ["跳过，继续下一条"],
@@ -572,7 +564,7 @@ describe("executor：中断（Esc）与停止", () => {
 		expect(state.tasks[1]!.status).toBe("ok");
 	});
 
-	it("aborted → 选择「重试本条」后成功", async () => {
+	it("aborted → choosing retry succeeds", async () => {
 		const { harness: h, state } = makeHarness({
 			outcomes: ["aborted", "ok"],
 			selectResponses: ["重试本条"],
@@ -585,7 +577,7 @@ describe("executor：中断（Esc）与停止", () => {
 		expect(state.tasks[0]!.status).toBe("ok");
 	});
 
-	it("aborted → 选择「终止整批」", async () => {
+	it("aborted → choosing terminate", async () => {
 		const { harness: h, state } = makeHarness({
 			outcomes: ["aborted", "ok"],
 			selectResponses: ["终止整批"],
@@ -599,7 +591,7 @@ describe("executor：中断（Esc）与停止", () => {
 		expect(state.tasks[1]!.status).toBe("pending");
 	});
 
-	it("stop --now：aborted 直接定案终止，不弹选择框", async () => {
+	it("stop --now: an aborted run terminates directly without a dialog", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["aborted", "ok"] });
 		addTasks(state, [
 			["continue", "任务一"],
@@ -612,12 +604,13 @@ describe("executor：中断（Esc）与停止", () => {
 		await run(h, state);
 
 		expect(h.selects).toHaveLength(0);
-		// ctx.abort() 由 index 的 stop 命令层调用（见手工验收），引擎只负责按 aborted 定案
+		// ctx.abort() is invoked by index.ts's stop command layer (see manual
+		// acceptance); the engine only finalizes based on aborted.
 		expect(state.tasks[0]!.status).toBe("failed");
 		expect(state.tasks[1]!.status).toBe("pending");
 	});
 
-	it("温和停止：当前任务自然结束后不再推进", async () => {
+	it("gentle stop: no advancing after the current task ends naturally", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok", "ok", "ok"] });
 		addTasks(state, [
 			["continue", "任务一"],
@@ -637,8 +630,8 @@ describe("executor：中断（Esc）与停止", () => {
 	});
 });
 
-describe("executor：发送失败与排队消息", () => {
-	it("发送后始终空闲（无运行启动）→ 看门狗按失败处理（void 发送，宽限期归零）", async () => {
+describe("executor: send failures and queued messages", () => {
+	it("stays idle after send (no run starts) → watchdog fails the task (void send, zero grace)", async () => {
 		const { harness: h, state } = makeHarness({
 			outcomes: ["noshow", "ok"],
 			retries: 0,
@@ -658,7 +651,7 @@ describe("executor：发送失败与排队消息", () => {
 		expect(state.tasks[1]!.status).toBe("ok");
 	});
 
-	it("void 发送看门狗含宽限期：错误文案按基础窗口+宽限期计时（容忍慢认证/弱网）", async () => {
+	it("void-send watchdog includes the grace period: message reports base window + grace (tolerates slow auth / weak network)", async () => {
 		const { harness: h, state } = makeHarness({
 			outcomes: ["noshow", "ok"],
 			retries: 0,
@@ -674,12 +667,12 @@ describe("executor：发送失败与排队消息", () => {
 		await run(h, state);
 
 		expect(state.tasks[0]).toMatchObject({ status: "failed" });
-		// 400ms 基础窗口 + 600ms 宽限 = 1000ms → 文案为 1s（若未加宽限则为 0s）
+		// 400ms base window + 600ms grace = 1000ms → the message says 1s (0s without grace).
 		expect(state.tasks[0]!.error).toContain("1s 内未开始任何运行");
 		expect(state.tasks[0]!.error).not.toContain("事件桥");
 	});
 
-	it("运行已结束但未收到 settled（事件桥断裂）→ 按失败处理并提示事件桥/agent_settled", async () => {
+	it("run finished but settled never arrived (broken event bridge) → fails with an event-bridge/agent_settled hint", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["silent"], retries: 0, onExhaust: "skip" });
 		addTasks(state, [["new", "桥断了"]]);
 
@@ -690,7 +683,7 @@ describe("executor：发送失败与排队消息", () => {
 		expect(state.tasks[0]!.error).toContain("事件桥");
 	});
 
-	it("发送前存在排队消息：先等待消化再发送", async () => {
+	it("queued messages before sending: drain first, then send", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok"] });
 		addTasks(state, [["continue", "任务一"]]);
 		h.root.pending = 2;
@@ -701,7 +694,7 @@ describe("executor：发送失败与排队消息", () => {
 		expect(state.tasks[0]!.status).toBe("ok");
 	});
 
-	it("error 结果带 errorMessage：写入任务记录", async () => {
+	it("an error outcome with errorMessage: written into the task record", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["error"], retries: 0, onExhaust: "skip" });
 		addTasks(state, [["continue", "会挂"]]);
 
@@ -710,8 +703,8 @@ describe("executor：发送失败与排队消息", () => {
 	});
 });
 
-describe("executor：断点续跑起点", () => {
-	it("switch 起点：切换到前置会话文件并从指定任务继续", async () => {
+describe("executor: resume start points", () => {
+	it("switch start: switches to the previous session file and continues at the given task", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok", "ok"] });
 		addTasks(state, [
 			["new", "已完成"],
@@ -729,7 +722,7 @@ describe("executor：断点续跑起点", () => {
 		expect(state.tasks[1]!.sessionFile).toBe(prevSessionFile);
 	});
 
-	it("fresh 起点（降级）：新会话中继续", async () => {
+	it("fresh start (fallback): continues in a new session", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok"] });
 		addTasks(state, [
 			["new", "已完成"],
@@ -743,7 +736,7 @@ describe("executor：断点续跑起点", () => {
 		expect(h.root.children[0]!.sends).toEqual(["prompt-2-断点任务"]);
 	});
 
-	it("direct 起点跳过已完成任务，从断点任务开始", async () => {
+	it("direct start skips completed tasks and begins at the breakpoint task", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok"] });
 		addTasks(state, [
 			["new", "已完成"],
@@ -753,14 +746,14 @@ describe("executor：断点续跑起点", () => {
 
 		await run(h, state, { kind: "direct", index: 1 });
 
-		// 断点任务是 new 模式 → 引擎在循环内 newSession
+		// The breakpoint task is "new" → the engine calls newSession inside the loop.
 		expect(h.root.newSessionCalls).toBe(1);
 		expect(h.root.children[0]!.sends).toEqual(["prompt-2-断点任务"]);
 	});
 });
 
-describe("executor：收尾行为", () => {
-	it("newSession 被取消 → 视为终止整批并收尾", async () => {
+describe("executor: finalization", () => {
+	it("a cancelled newSession → treated as terminating the batch and finalized", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok"], newSessionCancelled: true });
 		addTasks(state, [["new", "任务一"]]);
 
@@ -773,7 +766,7 @@ describe("executor：收尾行为", () => {
 		expect(h.batchEnded).toBe(1);
 	});
 
-	it("汇总通知区分 warning（有失败）与 info（全成功）", async () => {
+	it("summary notification distinguishes warning (failures) from info (all good)", async () => {
 		{
 			const { harness: h, state } = makeHarness({ outcomes: ["ok", "ok"] });
 			addTasks(state, [
@@ -795,7 +788,7 @@ describe("executor：收尾行为", () => {
 		}
 	});
 
-	it("progress 文件在任务开始/结束时即时落盘", async () => {
+	it("the progress file is persisted immediately as tasks start/finish", async () => {
 		const { harness: h, state, tmp } = makeHarness({ outcomes: ["ok", "ok"] });
 		addTasks(state, [
 			["continue", "A"],
@@ -815,16 +808,16 @@ describe("executor：收尾行为", () => {
 });
 
 // ============================================================================
-// 补充：结果判定 / 发送异常 / 降级与兜底 / 排水超时 / 预设停止
+// Extras: outcome judgment / send exceptions / fallbacks / drain timeout / preset stop
 // ============================================================================
 
-describe("lastAssistantMessage（导出函数单测）", () => {
-	it("空 branch → undefined", () => {
+describe("lastAssistantMessage (exported-function unit tests)", () => {
+	it("empty branch → undefined", () => {
 		const ctx = { sessionManager: { getSessionFile: () => undefined, getBranch: () => [] } } as unknown as BatchContext;
 		expect(lastAssistantMessage(ctx)).toBeUndefined();
 	});
 
-	it("从分支末尾向前找最后一条 assistant，跳过 user 与非 message 条目", () => {
+	it("finds the last assistant from the branch end, skipping user and non-message entries", () => {
 		const branch: BranchEntryView[] = [
 			{ type: "message", message: { role: "user" } },
 			{ type: "summary" },
@@ -835,15 +828,15 @@ describe("lastAssistantMessage（导出函数单测）", () => {
 		expect(lastAssistantMessage(ctx)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
 
-	it("branch 上没有 assistant → undefined", () => {
+	it("no assistant on the branch → undefined", () => {
 		const branch: BranchEntryView[] = [{ type: "message", message: { role: "user" } }];
 		const ctx = { sessionManager: { getSessionFile: () => undefined, getBranch: () => branch } } as unknown as BatchContext;
 		expect(lastAssistantMessage(ctx)).toBeUndefined();
 	});
 });
 
-describe("executor：发送异常", () => {
-	it("send 同步抛异常 → send-failed（retries 0 + skip → failed）", async () => {
+describe("executor: send exceptions", () => {
+	it("send throws synchronously → send-failed (retries 0 + skip → failed)", async () => {
 		const { harness: h, state } = makeHarness({ retries: 0, onExhaust: "skip" });
 		h.onSend = () => {
 			throw new Error("sync boom");
@@ -857,7 +850,7 @@ describe("executor：发送异常", () => {
 		expect(state.tasks[0]!.error).toContain("sync boom");
 	});
 
-	it("send 返回 rejected Promise → send-failed，后续任务正常", async () => {
+	it("send returns a rejected Promise → send-failed, later tasks proceed", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["reject", "ok"], retries: 0, onExhaust: "skip" });
 		addTasks(state, [
 			["new", "发不出去"],
@@ -869,15 +862,16 @@ describe("executor：发送异常", () => {
 		expect(state.tasks[0]).toMatchObject({ status: "failed", attempts: 1 });
 		expect(state.tasks[0]!.error).toContain("发送失败");
 		expect(state.tasks[0]!.error).toContain("send boom");
-		// 失败定案的任务也刷新落点会话：sessionFile 指向本次尝试所在的新会话，
-		// 而非发送前的旧值（report.md 会话列不缺席/不错挂）
+		// Failed tasks also refresh their landing session: sessionFile points at
+		// the new session of this attempt, not the stale pre-send value (the
+		// report.md session column stays present and correct).
 		expect(state.tasks[0]!.sessionFile).toBe(h.root.children[0]!.sessionFile);
 		expect(state.tasks[1]!.status).toBe("ok");
 	});
 });
 
-describe("executor：降级与内部错误兜底", () => {
-	it("switch 起点 switchSession 抛错 → notify 降级 → 新会话中继续执行", async () => {
+describe("executor: fallbacks and internal-error safety net", () => {
+	it("switchSession throws on a switch start → notify fallback → continues in a fresh session", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok"], switchFails: true });
 		addTasks(state, [
 			["new", "已完成"],
@@ -894,7 +888,7 @@ describe("executor：降级与内部错误兜底", () => {
 		expect(state.tasks[1]!.status).toBe("ok");
 	});
 
-	it("fresh 起点 + newSession 被取消 → 终止整批并收尾", async () => {
+	it("fresh start + cancelled newSession → terminates the batch and finalizes", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: ["ok"], newSessionCancelled: true });
 		addTasks(state, [
 			["new", "已完成"],
@@ -909,7 +903,7 @@ describe("executor：降级与内部错误兜底", () => {
 		expect(h.batchEnded).toBe(1);
 	});
 
-	it("waitForIdle 抛错 → startBatch 兜底收尾（内部错误汇总 + running 重置 pending + report 仍生成）", async () => {
+	it("waitForIdle throws → startBatch safety net (internal-error summary + running reset to pending + report still written)", async () => {
 		const { harness: h, state, tmp } = makeHarness({ outcomes: ["ok"], throwOnWait: true });
 		addTasks(state, [["continue", "任务一"]]);
 
@@ -920,13 +914,14 @@ describe("executor：降级与内部错误兜底", () => {
 		expect(fs.existsSync(path.join(tmp, "list.md.report.md"))).toBe(true);
 		expect(state.tasks[0]!.status).toBe("pending");
 		expect(state.tasks[0]!.error).toBe("批次提前结束");
-		// 重置回 pending 的任务未真正执行结束：不应携带 endedAt（report 语义噪声）
+		// A task reset to pending never really finished: it must not carry an
+		// endedAt (report semantic noise).
 		expect(state.tasks[0]!.endedAt).toBeUndefined();
 	});
 });
 
-describe("executor：排队消化超时与预设停止", () => {
-	it("排队消息永不消化 → 超过 5 分钟排水上限按 send-failed 处理", async () => {
+describe("executor: drain timeout and preset stop", () => {
+	it("queued messages never drain → send-failed after the 5-minute drain ceiling", async () => {
 		const { harness: h, state } = makeHarness({ retries: 0, onExhaust: "skip", neverDrain: true });
 		addTasks(state, [["continue", "排不上队"]]);
 		h.root.pending = 2;
@@ -937,7 +932,7 @@ describe("executor：排队消化超时与预设停止", () => {
 		expect(state.tasks[0]!.error).toContain("等待既有排队消息消化超时");
 	}, 20_000);
 
-	it("运行前已置 stopFlag=gentle → 立即收尾，全部任务保持 pending", async () => {
+	it("stopFlag=gentle preset before running → finalizes immediately, all tasks stay pending", async () => {
 		const { harness: h, state } = makeHarness({ outcomes: [] });
 		addTasks(state, [
 			["continue", "任务一"],

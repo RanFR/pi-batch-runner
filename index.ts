@@ -1,18 +1,22 @@
 /**
- * pi-batch-runner：pi 批处理扩展。
+ * pi-batch-runner: batch-processing extension for pi.
  *
- * 在单个 TUI 窗口中顺序执行清单文件里的多个提示词任务：
- * - 默认每个任务在全新会话中执行（上下文隔离）；
- * - 标记「继续」的任务沿用上一个任务的会话；
- * - 单任务失败自动重试（--retries，默认 3），耗尽后按 --on-exhaust（默认 pause）处理；
- * - 全部完成后显示汇总并停留在 pi 中。
+ * Runs multiple prompt tasks from a manifest file sequentially in a single TUI
+ * window:
+ * - By default each task runs in a fresh session (context isolation);
+ * - Tasks marked "continue" reuse the previous task's session;
+ * - A failed task retries automatically (--retries, default 3); once retries
+ *   are exhausted, behavior follows --on-exhaust (default pause);
+ * - When everything finishes, a summary is shown and pi stays open.
  *
- * 用法：
- *   /batch <清单文件> [--dry-run] [--start N] [--retries N] [--on-exhaust pause|skip|abort]
+ * Usage:
+ *   /batch <manifest> [--dry-run] [--start N] [--retries N] [--on-exhaust pause|skip|abort]
  *   /batch stop [--now]
  *   /batch status
  *
- * 仅支持 TUI 模式；print/rpc/json 模式下启动会被拒绝。
+ * TUI mode only; startup is rejected in print/rpc/json mode.
+ *
+ * @module
  */
 
 import * as fs from "node:fs";
@@ -22,9 +26,11 @@ import { startBatch, createStopHandle, type StartPoint, type StopHandle } from "
 import { ManifestParseError, parseManifest, tokenizeArgs } from "./lib/parser.ts";
 import * as progress from "./lib/progress.ts";
 import * as report from "./lib/report.ts";
-import type { BatchContext, BatchLeg, BatchState, EngineDeps, SettledBus, TaskRecord } from "./lib/types.ts";
+import type { BatchContext, BatchLeg, BatchState, BatchTask, EngineDeps, SettledBus, TaskRecord } from "./lib/types.ts";
 import { DEFAULT_ON_EXHAUST, DEFAULT_RETRIES } from "./lib/types.ts";
 
+// User-facing strings (USAGE, notifications, dialogs) are intentionally in
+// Chinese to match the rest of the product UI.
 const USAGE = [
 	"用法：",
 	"  /batch <清单文件> [--dry-run] [--start N] [--retries N] [--on-exhaust pause|skip|abort]",
@@ -33,19 +39,26 @@ const USAGE = [
 ].join("\n");
 
 /**
- * 模块级「接线」状态。
+ * Module-level "wiring" state.
  *
- * 实测（pi 1.4.0）：每次会话替换（newSession/switchSession）都会新建 resourceLoader
- * 并重新执行扩展工厂函数（jiti 仅缓存工厂函数对象本身，模块只求值一次）。
- * 工厂体内的 let 变量随每次执行重建，跨替换不可用；只有模块级变量存活。
+ * Observed behavior (pi 1.4.0, re-checked on 1.5.2 with no changes): every
+ * session replacement (newSession/switchSession) creates a new resourceLoader
+ * and re-runs the extension factory function (jiti only caches the factory
+ * function object itself; the module is evaluated once). `let` variables inside
+ * the factory body are rebuilt on each run and do not survive replacements;
+ * only module-level variables persist.
  *
- * 因此这里只允许存放「接线」性质的状态：事件监听槽位、防重入标志。
- * 批次数据一律以 progress 文件为唯一事实源（PLAN 陷阱 5）。
+ * Therefore only "wiring" state may live here: event-listener slots and
+ * re-entrancy flags. Batch data always uses the progress file as the single
+ * source of truth (PLAN pitfall 5).
  *
- * ⚠ /reload 会以新代际重新求值本模块：settledListener / activeBatch 全部归零。
- * 运行中批次的引擎闭包仍持有旧的 SettledBus（写入旧模块实例的槽位），而事件只会
- * 派发给新实例注册的处理器 → 引擎永远收不到 agent_settled，看门狗逐任务误判
- * send-failed，批次退化为失败循环。批处理期间禁止 /reload（README「运行中干预」）。
+ * Warning: /reload re-evaluates this module in a new generation, zeroing both
+ * settledListener and activeBatch. The running engine closure still holds the
+ * old SettledBus (written into the old module instance's slot), while events
+ * are only dispatched to handlers registered by the new instance → the engine
+ * never receives agent_settled, the watchdog misjudges every task as
+ * send-failed, and the batch degenerates into a failure loop. /reload is
+ * forbidden while a batch runs (see README "运行中干预").
  */
 let settledListener: ((event: { aborted: boolean }) => void) | undefined;
 let activeBatch: ActiveBatch | null = null;
@@ -55,7 +68,7 @@ interface ActiveBatch {
 	listFile: string;
 }
 
-/** 诊断日志：设 PI_BATCH_DEBUG=1 时写 /tmp/pi-batch-debug.log */
+/** Diagnostic log: appends to /tmp/pi-batch-debug.log when PI_BATCH_DEBUG=1. */
 function debugCmd(msg: string): void {
 	if (!process.env.PI_BATCH_DEBUG) return;
 	try {
@@ -66,16 +79,14 @@ function debugCmd(msg: string): void {
 }
 
 /**
- * 会话切换回调拿到的 fresh 上下文类型（ReplacedSessionContext）。
- * 1.4.0 包根未导出该类型名，从 newSession 的 withSession 回调签名结构推导。
+ * Fresh context type received by session-switch callbacks
+ * (ReplacedSessionContext). Neither the 1.4.0 nor the 1.5.2 package root
+ * exports the type name, so it is derived structurally from newSession's
+ * withSession callback signature.
  */
-type ReplacedSessionContext = Parameters<
-	NonNullable<
-		NonNullable<Parameters<ExtensionCommandContext["newSession"]>[0]>["withSession"]
-	>
->[0];
+type ReplacedSessionContext = Parameters<NonNullable<NonNullable<Parameters<ExtensionCommandContext["newSession"]>[0]>["withSession"]>>[0];
 
-/** 引擎所需的窄上下文视图（ExtensionCommandContext / ReplacedSessionContext 的结构子集） */
+/** Adapts a real context into the narrow view the executor needs (structural subset of ExtensionCommandContext / ReplacedSessionContext). */
 function adaptCtx(ctx: ExtensionCommandContext): BatchContext {
 	return {
 		isIdle: () => ctx.isIdle(),
@@ -92,18 +103,21 @@ function adaptCtx(ctx: ExtensionCommandContext): BatchContext {
 			setStatus: (key, text) => ctx.ui.setStatus(key, text),
 			setWidget: (key, content) => ctx.ui.setWidget(key, content),
 		},
-		newSession: (opts) =>
-			ctx.newSession({
-				// 新会话命名：经 setup 直写 sessionManager（会话替换后旧 pi 门面不可用）
-				...(opts.name
+		newSession: (opts) => {
+			// Naming goes through `setup` straight into the session manager:
+			// the old pi facade is stale after the session replacement.
+			const name = opts.name;
+			return ctx.newSession({
+				...(name
 					? {
-						setup: async (sm: { appendSessionInfo: (name: string) => string }) => {
-							sm.appendSessionInfo(opts.name!);
+							setup: async (sm: { appendSessionInfo: (name: string) => string }) => {
+								sm.appendSessionInfo(name);
+							},
 						}
-					}
 					: {}),
 				withSession: (fresh) => opts.withSession(adaptFreshLeg(fresh)),
-			}),
+			});
+		},
 		switchSession: (p, opts) =>
 			ctx.switchSession(p, {
 				withSession: (fresh) => opts.withSession(adaptFreshLeg(fresh)),
@@ -111,7 +125,7 @@ function adaptCtx(ctx: ExtensionCommandContext): BatchContext {
 	};
 }
 
-/** 把切换后的真实上下文包成引擎所需的完整 leg（新上下文 + 对应的发送函数） */
+/** Wraps the real post-switch context into the complete leg the executor needs (fresh context + matching send function). */
 function adaptFreshLeg(fresh: ReplacedSessionContext): BatchLeg {
 	return {
 		ctx: adaptCtx(fresh),
@@ -119,6 +133,7 @@ function adaptFreshLeg(fresh: ReplacedSessionContext): BatchLeg {
 	};
 }
 
+/** Narrows a real session-branch entry into the read-only view the executor inspects. */
 function adaptEntry(entry: SessionEntry): ReturnType<BatchContext["sessionManager"]["getBranch"]>[number] {
 	if (entry.type === "message") {
 		const m = entry.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
@@ -131,9 +146,10 @@ function adaptEntry(entry: SessionEntry): ReturnType<BatchContext["sessionManage
 }
 
 export default function batchRunnerExtension(pi: ExtensionAPI): void {
-	// agent_settled 事件桥：每次工厂执行都在当前 runner 上重新注册处理器
-	// （旧 Extension 对象随旧 runner 一起被丢弃），处理器与引擎通过模块级
-	// 监听槽位对接，不捕获任何 pi/ctx 运行时对象。
+	// agent_settled event bridge: re-register the handler on the current runner
+	// at every factory execution (the old Extension object is discarded along
+	// with the old runner). The handler connects to the engine through the
+	// module-level listener slot and captures no pi/ctx runtime objects.
 	pi.on("agent_settled", (event) => {
 		settledListener?.({ aborted: event.aborted });
 	});
@@ -149,9 +165,10 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("batch", {
 		description: "批处理：顺序执行清单中的提示词任务（/batch <清单.md> [选项] | stop | status）",
 		getArgumentCompletions: (prefix) => {
-			// 注：pi 1.4.0 的 getArgumentCompletions(prefix) 不提供会话上下文，
-			// 目录只能取 process.cwd()（会话 cwd 与扩展进程 cwd 不一致的极端场景下
-			// 补全源可能不符，属上游 API 限制）
+			// Note: pi 1.5.2's getArgumentCompletions(prefix) still provides no
+			// session context, so the listing can only use process.cwd() (in the
+			// rare case where the session cwd differs from the extension process
+			// cwd, completions may not match — an upstream API limitation).
 			const raw = prefix.trim();
 			const openedQuote = raw.startsWith('"');
 			const p = openedQuote ? raw.slice(1) : raw;
@@ -162,14 +179,16 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 				for (const entry of fs.readdirSync(process.cwd(), { withFileTypes: true })) {
 					if (!entry.isFile() || !/\.(md|txt)$/i.test(entry.name)) continue;
 					if (p && !entry.name.startsWith(p)) continue;
-					// pi 对命令参数补全按 value 原样插入（不自动加引号）：含空格的文件名
-					// 必须自带双引号，否则 tokenizeArgs 会拆成多个 token；用户已输入
-					// 开引号时同样闭合（与 pi 内建文件补全的 buildCompletionValue 语义一致）
+					// pi inserts command-argument completions verbatim from `value`
+					// (no automatic quoting): file names containing spaces must carry
+					// their own double quotes, or tokenizeArgs splits them into
+					// multiple tokens; when the user already typed an opening quote,
+					// close it too (same semantics as pi's built-in file completion).
 					const value = openedQuote || /\s/.test(entry.name) ? `"${entry.name}"` : entry.name;
 					items.push({ value, label: entry.name });
 				}
 			} catch {
-				// 目录不可读时只补全子命令
+				// Unreadable directory: only complete the subcommands.
 			}
 			return items.length > 0 ? items : null;
 		},
@@ -183,7 +202,7 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 	});
 
 	// ------------------------------------------------------------------
-	// 命令分发
+	// Command dispatch
 	// ------------------------------------------------------------------
 
 	async function dispatch(rawArgs: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -247,9 +266,10 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 		ctx.ui.setWidget("batch-summary", report.widgetLines(state, Date.now()));
 	}
 
+	/** Fallback when activeBatch is lost (e.g. after /reload): scan *.progress.json in the current cwd. */
 	function findLatestProgress(ctx: ExtensionCommandContext): BatchState | null {
-		// 退化路径：activeBatch 丢失（如 /reload）后，尝试当前 cwd 下的 *.progress.json。
-		// 多个候选时按修改时间取最新（并列时按文件名定序），避免依赖 readdir 顺序的不确定性。
+		// With multiple candidates, pick the most recently modified (ties broken
+		// by file name) to avoid depending on readdir order.
 		try {
 			let best: { name: string; mtime: number; state: BatchState } | undefined;
 			for (const entry of fs.readdirSync(ctx.cwd)) {
@@ -261,7 +281,7 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 				try {
 					mtime = fs.statSync(path.join(ctx.cwd, entry)).mtimeMs;
 				} catch {
-					// stat 失败按最旧处理，仍可作为候选
+					// stat failure counts as oldest; still a candidate.
 				}
 				if (!best || mtime > best.mtime || (mtime === best.mtime && entry > best.name)) {
 					best = { name: entry, mtime, state };
@@ -275,15 +295,15 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 	}
 
 	// ------------------------------------------------------------------
-	// /batch <清单文件> [选项]
+	// /batch <manifest> [options]
 	// ------------------------------------------------------------------
 
 	async function startBatchCommand(tokens: string[], ctx: ExtensionCommandContext): Promise<void> {
-		// 启动前置检查
+		// Pre-flight checks.
 		if (ctx.mode !== "tui") {
 			const msg = "/batch 仅支持 TUI 交互模式（print/rpc/json 模式没有交互 UI）";
-			ctx.ui.notify(msg, "error"); // 有 UI 的模式（rpc）走 notify
-			if (!ctx.hasUI) console.error(msg); // print/json 模式 notify 是空操作，落到 stderr
+			ctx.ui.notify(msg, "error"); // Modes with a UI (rpc) go through notify.
+			if (!ctx.hasUI) console.error(msg); // notify is a no-op in print/json; fall back to stderr.
 			return;
 		}
 		if (activeBatch) {
@@ -295,7 +315,9 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// 参数解析（explicit 标志用于断点续跑时的配置覆盖语义：显式传入才覆盖，见下方续跑分支）
+		// Option parsing. The *Explicit flags drive the resume override semantics:
+		// only options passed on this command line override the progress file's
+		// saved values (see the resume branch below).
 		const config = { retries: DEFAULT_RETRIES, onExhaust: DEFAULT_ON_EXHAUST, startAt: 1, dryRun: false };
 		let retriesExplicit = false;
 		let onExhaustExplicit = false;
@@ -350,35 +372,37 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// 读取清单
+		// Read the manifest.
 		const listFile = path.resolve(ctx.cwd, fileArg);
 		if (!fs.existsSync(listFile)) {
 			ctx.ui.notify(`清单文件不存在：${listFile}`, "error");
 			return;
 		}
-		let tasks;
+		let tasks: BatchTask[];
 		try {
 			const content = fs.readFileSync(listFile, "utf-8");
 			tasks = parseManifest(content);
 		} catch (e) {
-			const msg = e instanceof ManifestParseError ? `清单解析失败：${e.message}` : `读取清单失败：${e instanceof Error ? e.message : String(e)}`;
+			const msg =
+				e instanceof ManifestParseError ? `清单解析失败：${e.message}` : `读取清单失败：${e instanceof Error ? e.message : String(e)}`;
 			ctx.ui.notify(msg, "error");
 			return;
 		}
 
-		// --start 越界校验：dry-run 预览同样需要报错（否则预览会展示全部任务，误导用户）
+		// --start bounds check: dry-run preview must fail too (otherwise the
+		// preview would show all tasks and mislead the user).
 		if (config.startAt > tasks.length) {
 			ctx.ui.notify(`--start ${config.startAt} 超出任务总数（${tasks.length}）`, "error");
 			return;
 		}
 
-		// dry-run：仅预览
+		// dry-run: preview only.
 		if (config.dryRun) {
 			previewTasks(ctx, listFile, tasks, config.startAt);
 			return;
 		}
 
-		// 断点检测：<清单>.progress.json（未 done）且有未终结任务
+		// Resume detection: <manifest>.progress.json (not done) with non-terminal tasks.
 		const saved = progress.loadProgress(listFile);
 		let startPoint: StartPoint | undefined;
 		let state: BatchState | undefined;
@@ -391,13 +415,16 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				if (choice === "从断点继续") {
-					// 清单重新解析过：以清单为准合并 prompt/标题/模式，状态沿用 progress 文件
+					// The manifest was re-parsed: merge prompt/title/mode from the
+					// manifest (authoritative) while keeping status from the file.
 					if (saved.tasks.length !== tasks.length) {
 						ctx.ui.notify("清单任务数与断点进度不一致（清单可能已修改），请选择「从头重新开始」", "error");
 						return;
 					}
-					// 本次命令行显式传入的配置覆盖进度文件中的旧值；未传入的沿用（避免静默回退到默认值）。
-					// --start 在续跑时无意义（起点由断点决定），显式传入时明确提示被忽略。
+					// Options explicitly passed on this command line override the old
+					// values in the progress file; omitted ones carry over (avoiding a
+					// silent fallback to defaults). --start is meaningless when
+					// resuming (the breakpoint decides the start); if given, say so.
 					const overrides: string[] = [];
 					if (retriesExplicit) {
 						saved.retries = config.retries;
@@ -419,8 +446,9 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 						...saved,
 						tasks: saved.tasks.map((r, k) => ({
 							...r,
-							// 上次中断时停在 running 的任务重置为 pending；attempts 不在此处改动，
-							// runTask 对 pending 任务首次开始时会清零（测试已钉住该行为）
+							// Tasks left "running" by the last interruption reset to
+							// pending; attempts are not touched here — runTask zeroes
+							// them on a pending task's first start (pinned by tests).
 							status: r.status === "running" ? ("pending" as const) : r.status,
 							mode: tasks[k]!.mode,
 							title: tasks[k]!.title,
@@ -438,7 +466,7 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 		}
 
 		if (!state) {
-			// 全新批次
+			// Brand-new batch.
 			state = {
 				listFile,
 				batchTitle: path.basename(listFile).replace(/\.(md|txt)$/i, ""),
@@ -460,7 +488,7 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 			startPoint = { kind: "direct", index: config.startAt - 1 };
 		}
 
-		// 初始化运行
+		// Initialize the run.
 		const stop = createStopHandle();
 		activeBatch = { stop, listFile };
 		progress.saveProgress(state);
@@ -480,20 +508,19 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 			},
 		};
 		const leg: BatchLeg = { ctx: adaptCtx(ctx), send: (content, options) => pi.sendUserMessage(content, options) };
-		await startBatch(deps, leg, state, startPoint!, stop);
+		if (!state || !startPoint) return; // unreachable: every branch above sets both
+		await startBatch(deps, leg, state, startPoint, stop);
 	}
 
-	/** 断点续跑起点规划：返回 startPoint 与可选提示；无法规划返回 null */
-	function resumePlan(
-		saved: BatchState,
-		openIndex: number,
-	): { startPoint: StartPoint; notify?: string } | null {
+	/** Plans the resume start point: returns a startPoint plus an optional notice; null when no plan is possible. */
+	function resumePlan(saved: BatchState, openIndex: number): { startPoint: StartPoint; notify?: string } | null {
 		const record = saved.tasks[openIndex]!;
 		if (record.mode === "new") {
 			return { startPoint: { kind: "direct", index: openIndex } };
 		}
 		if (openIndex === 0) {
-			// 首条被标记「继续」：按文档行为在当前交互会话继续
+			// The first task is marked "continue": per the documented behavior,
+			// continue in the current interactive session.
 			return { startPoint: { kind: "direct", index: 0 } };
 		}
 		const prev = saved.tasks[openIndex - 1]!;
@@ -506,13 +533,8 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 		};
 	}
 
-	/** dry-run 预览 */
-	function previewTasks(
-		ctx: ExtensionCommandContext,
-		listFile: string,
-		tasks: ReturnType<typeof parseManifest>,
-		startAt: number,
-	): void {
+	/** dry-run preview. */
+	function previewTasks(ctx: ExtensionCommandContext, listFile: string, tasks: ReturnType<typeof parseManifest>, startAt: number): void {
 		const lines: string[] = [];
 		lines.push(`── 批处理预览 · ${path.basename(listFile)} · 共 ${tasks.length} 个任务${startAt > 1 ? ` · 从第 ${startAt} 条开始` : ""}`);
 		for (const t of tasks) {
@@ -525,6 +547,6 @@ export default function batchRunnerExtension(pi: ExtensionAPI): void {
 	}
 
 	function statusIcon(mode: "new" | "continue"): string {
-		return mode === "new" ? "[新会话]" : "[继续]  ";
+		return mode === "new" ? "[new]" : "[continue]";
 	}
 }

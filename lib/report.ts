@@ -1,10 +1,13 @@
 /**
- * 汇总渲染：状态栏文案、汇总 widget、report.md。
+ * Summary rendering: status-bar text, summary widget, and report.md.
+ *
+ * String literals below (status labels, report sections) are user-facing
+ * output and intentionally stay in Chinese to match the rest of the UI.
  */
 
 import type { BatchState, TaskRecord } from "./types.ts";
 
-/** 毫秒 → 4m12s / 12s / 1h02m */
+/** Formats milliseconds as 4m12s / 12s / 1h02m. */
 export function formatDuration(ms: number): string {
 	if (!Number.isFinite(ms) || ms < 0) return "-";
 	const s = Math.round(ms / 1000);
@@ -24,6 +27,7 @@ export interface BatchCounts {
 	total: number;
 }
 
+/** Counts tasks by status for the whole batch. */
 export function countTasks(state: BatchState): BatchCounts {
 	const counts: BatchCounts = { ok: 0, failed: 0, skipped: 0, pending: 0, running: 0, total: state.tasks.length };
 	for (const t of state.tasks) {
@@ -62,7 +66,7 @@ function truncate(text: string, max: number): string {
 	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
-/** 运行中状态栏文案：[batch] 任务 3/10 · 标题 · 第1次尝试 · 4m12s */
+/** Status-bar text while running: `[batch] 任务 3/10 · 标题 · 第1次尝试 · 4m12s`. */
 export function statusText(state: BatchState, now: number): string {
 	const current = state.tasks.find((t) => t.status === "running");
 	if (!current) {
@@ -73,7 +77,7 @@ export function statusText(state: BatchState, now: number): string {
 	return `[batch] 任务 ${current.index}/${state.tasks.length} · ${truncate(current.title, 24)} · 第${current.attempts}次尝试 · ${elapsed}`;
 }
 
-/** 汇总通知一行文案 */
+/** One-line summary for the completion notification. */
 export function summaryLine(state: BatchState): string {
 	const c = countTasks(state);
 	const parts = [`成功 ${c.ok}`];
@@ -83,7 +87,7 @@ export function summaryLine(state: BatchState): string {
 	return `批次「${state.batchTitle}」结束：${parts.join(" / ")}`;
 }
 
-/** 编辑器上方常驻 widget 行 */
+/** Persistent widget lines shown above the editor. */
 export function widgetLines(state: BatchState, now: number): string[] {
 	const lines: string[] = [];
 	lines.push(`── 批处理 · ${state.batchTitle} · ${summaryLine(state)}`);
@@ -99,7 +103,9 @@ export function widgetLines(state: BatchState, now: number): string[] {
 		if (t.error) extra += ` · ${truncate(t.error, 40)}`;
 		const sessionName = t.sessionFile ? truncate(fileName(t.sessionFile), 18) : "";
 		const sessionPart = t.mode === "continue" ? "" : sessionName ? ` [${sessionName}]` : "";
-		lines.push(`${STATUS_ICON[t.status]} ${String(t.index).padStart(2, " ")} [${MODE_LABEL[t.mode]}] ${truncate(t.title, max)}${sessionPart}${extra}`);
+		lines.push(
+			`${STATUS_ICON[t.status]} ${String(t.index).padStart(2, " ")} [${MODE_LABEL[t.mode]}] ${truncate(t.title, max)}${sessionPart}${extra}`,
+		);
 	}
 	return lines;
 }
@@ -109,7 +115,7 @@ function fileName(p: string): string {
 	return idx === -1 ? p : p.slice(idx + 1);
 }
 
-/** 完整汇总报告 markdown */
+/** Renders the full summary report as markdown. */
 export function renderReportMarkdown(state: BatchState, endedAt: number): string {
 	const c = countTasks(state);
 	const out: string[] = [];

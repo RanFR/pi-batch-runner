@@ -1,22 +1,34 @@
 /**
- * 执行引擎（核心）。
+ * Execution engine (core).
  *
- * 设计要点（对应 PLAN 第 6/7 节，全部经 pi 1.4.0 源码核对）：
+ * Design notes (PLAN sections 6/7; verified against pi 1.4.0 sources, re-checked
+ * on 1.5.2 with no changes):
  *
- * 1. 引擎由 /batch 命令 handler 驱动：newSession/switchSession/waitForIdle 只能在命令处理器
- *    上下文中调用，事件处理器里调用会死锁。agent_settled 订阅只用于「发信号」。
- * 2. 「新会话」边界通过 ctx.newSession({ withSession }) 的回调链推进：回调内用 fresh 上下文的
- *    sendUserMessage / waitForIdle / newSession / ui；跨边界只携带纯数据（任务记录、配置）。
- *    回调链深度 = 「新会话」边界数；同一会话内的连续任务在回调内 while 循环处理。
- * 3. 完成判定：先订阅 agent_settled（经注入的 SettledBus，订阅先于发送），发送后等待 settled；
- *    settled 后再 waitForIdle() 双保险（pi 内部 waitForIdle 在 agent_settled 派发完成后才 resolve，
- *    且 ReplacedSessionContext.sendUserMessage 的 Promise 也只在整轮 run 结束后 resolve，
- *    两条路径互为校验）。发送失败的看门狗：超时后仍 isIdle 且无 settled → 按失败处理，
- *    并根据会话分支是否推进区分「从未开始运行」与「运行已结束但未收到事件」（事件桥断裂）。
- *    void 发送（根会话）无第二完成信号，另加宽限期容忍慢认证/弱网。
- * 4. 失败判定看分支上最后一条 assistant 消息的 stopReason（"error"/"aborted"），
- *    settled.aborted 表示用户 Esc。
- * 5. 批次状态以 progress 文件为唯一事实源；本模块不持有跨会话的模块级状态。
+ * 1. The engine is driven by the /batch command handler: newSession/
+ *    switchSession/waitForIdle may only run inside a command-handler context —
+ *    calling them from event handlers deadlocks. The agent_settled subscription
+ *    is used for signaling only.
+ * 2. "New session" boundaries advance through the callback chain of
+ *    ctx.newSession({ withSession }): inside the callback the fresh context's
+ *    sendUserMessage / waitForIdle / newSession / ui are used; only plain data
+ *    (task records, config) crosses boundaries. Callback chain depth equals the
+ *    number of "new session" boundaries; consecutive tasks within one session
+ *    loop inside the same callback.
+ * 3. Completion is judged by subscribing to agent_settled first (via the
+ *    injected SettledBus, before sending), then waiting for settled, then
+ *    waitForIdle() as a double check (pi's internal waitForIdle resolves only
+ *    after agent_settled dispatch completes, and the Promise of
+ *    ReplacedSessionContext.sendUserMessage resolves only when the whole run
+ *    ends — the two paths cross-validate). Send-failure watchdog: after the
+ *    timeout, still isIdle with no settled event means failure, and whether the
+ *    session branch advanced distinguishes "never started running" from "run
+ *    finished but the event never arrived" (broken event bridge). A void send
+ *    (root session) has no second completion signal, so it gets an extra grace
+ *    period to tolerate slow auth / weak networks.
+ * 4. Failure is judged by the stopReason ("error"/"aborted") of the last
+ *    assistant message on the branch; settled.aborted means the user pressed Esc.
+ * 5. Batch state uses the progress file as the single source of truth; this
+ *    module holds no module-level state that spans sessions.
  */
 
 import * as fs from "node:fs";
@@ -32,35 +44,44 @@ import {
 	type TaskRecord,
 } from "./types.ts";
 
-/** 批次停止控制（index.ts 的 activeBatch 持有）。/reload 会使模块级状态归零：
- *  activeBatch 丢失仅致防重入与 stop 失效；settledListener 丢失则会让运行中批次
- *  收不到完成事件而退化为看门狗失败循环（批处理期间禁止 /reload，见 index.ts 头部注释） */
+/**
+ * Batch stop control (held by index.ts's activeBatch). /reload re-evaluates the
+ * module and resets module-level state: losing activeBatch only breaks the
+ * re-entrancy guard and stop; losing settledListener makes a running batch miss
+ * its completion events and degenerate into a watchdog failure loop (/reload is
+ * forbidden while a batch runs; see the index.ts header).
+ */
 export interface StopHandle {
-	/** no = 正常运行；gentle = 当前任务自然结束后停止；now = 中止当前任务并停止 */
+	/** "no" = running normally; "gentle" = stop after the current task ends naturally; "now" = abort the current task and stop. */
 	stopFlag: "no" | "gentle" | "now";
-	/** 汇总只做一次 */
+	/** Ensures the summary runs exactly once. */
 	finalized: boolean;
 }
 
+/** Creates a fresh stop handle (stopFlag = "no", not finalized). */
 export function createStopHandle(): StopHandle {
 	return { stopFlag: "no", finalized: false };
 }
 
 /**
- * 批次起点。
- * - direct：从当前 leg 的第 index 项（0-based）继续（新会话边界由引擎在循环内处理）；
- * - fresh：先开新会话再从 index 继续（断点续跑时「继续」任务丢失前置会话的降级路径）；
- * - switch：先切换到指定会话文件再从 index 继续（断点续跑找回原会话）。
+ * Where a batch starts.
+ * - direct: continue at item `index` (0-based) of the current leg (new-session
+ *   boundaries are handled by the engine loop);
+ * - fresh: open a new session first, then continue at `index` (fallback for a
+ *   resumed "continue" task whose previous session is gone);
+ * - switch: switch to the given session file first, then continue at `index`
+ *   (resume finds the original session).
  */
 export type StartPoint =
-	| { kind: "direct"; index: number }
-	| { kind: "fresh"; index: number }
-	| { kind: "switch"; sessionFile: string; index: number };
+	{ kind: "direct"; index: number } | { kind: "fresh"; index: number } | { kind: "switch"; sessionFile: string; index: number };
 
 type Outcome = "ok" | "error" | "aborted" | "send-failed";
 
+/** Outcome of a single attempt. */
 interface AttemptResult {
+	/** What happened during the attempt. */
 	outcome: Outcome;
+	/** Error summary, when the attempt failed. */
 	error?: string;
 }
 
@@ -68,7 +89,7 @@ function msgOf(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
 }
 
-/** 诊断日志：设 PI_BATCH_DEBUG=1 时写 /tmp/pi-batch-debug.log */
+/** Diagnostic log: appends to /tmp/pi-batch-debug.log when PI_BATCH_DEBUG=1. */
 function debug(msg: string): void {
 	if (!process.env.PI_BATCH_DEBUG) return;
 	try {
@@ -78,45 +99,46 @@ function debug(msg: string): void {
 	}
 }
 
+/** Flattens whitespace and truncates an error message, with a fallback label. */
 function shortError(text: string | undefined, max = 120): string {
 	const flat = (text ?? "").replace(/\s+/g, " ").trim();
 	if (!flat) return "未知错误";
 	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
+/** Returns the base name of a path. */
 function fileName(p: string): string {
 	const idx = p.lastIndexOf("/");
 	return idx === -1 ? p : p.slice(idx + 1);
 }
 
-/** 解析默认依赖（now/sleep/bell/sendFailTimeoutMs） */
+/** Fills in default dependencies (now/sleep/bell/sendFailTimeoutMs). */
 function withDefaults(deps: EngineDeps): Required<Pick<EngineDeps, "now" | "sleep" | "bell">> & EngineDeps {
 	return {
 		...deps,
 		now: deps.now ?? (() => Date.now()),
 		sleep: deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))),
-		bell: deps.bell ?? (() => {
-			try {
-				process.stdout.write("\x07");
-			} catch {
-				// 无终端时可忽略
-			}
-		}),
+		bell:
+			deps.bell ??
+			(() => {
+				try {
+					process.stdout.write("\x07");
+				} catch {
+					// No terminal attached: safe to ignore.
+				}
+			}),
 	};
 }
 
 // ============================================================================
-// 入口
+// Entry point
 // ============================================================================
 
-/** 启动批次：处理起点（direct/fresh/switch）后进入执行循环；保证恰好一次汇总收尾。 */
-export async function startBatch(
-	deps: EngineDeps,
-	leg: BatchLeg,
-	state: BatchState,
-	start: StartPoint,
-	stop: StopHandle,
-): Promise<void> {
+/**
+ * Starts a batch: resolves the start point (direct/fresh/switch) and enters the
+ * execution loop; guarantees exactly one final summary.
+ */
+export async function startBatch(deps: EngineDeps, leg: BatchLeg, state: BatchState, start: StartPoint, stop: StopHandle): Promise<void> {
 	const d = withDefaults(deps);
 	try {
 		if (start.kind === "switch") {
@@ -129,7 +151,8 @@ export async function startBatch(
 		}
 		await runFrom(d, leg, state, start.index, stop);
 	} catch (e) {
-		// 引擎级兜底：任何未预期异常都要收尾（汇总 + 清理 activeBatch）
+		// Engine-level safety net: any unexpected exception must still finalize
+		// (summary + activeBatch cleanup).
 		try {
 			await finalizeBatch(d, leg, state, stop, `内部错误：${shortError(msgOf(e))}`);
 		} catch {
@@ -138,7 +161,7 @@ export async function startBatch(
 	}
 }
 
-/** 断点续跑：切换到前置任务的会话文件；失败则降级为新会话执行。 */
+/** Resume: switches to the previous task's session file; falls back to a fresh session on failure. */
 async function startWithSwitch(
 	d: Required<Pick<EngineDeps, "now" | "sleep" | "bell">> & EngineDeps,
 	leg: BatchLeg,
@@ -163,12 +186,12 @@ async function startWithSwitch(
 	} catch (e) {
 		switchError = e;
 	}
-	// 降级：新会话执行
+	// Fallback: run in a fresh session.
 	leg.ctx.ui.notify(`无法恢复会话 ${fileName(sessionFile)}：${shortError(msgOf(switchError))}，改为新会话执行`, "warning");
 	await startWithFresh(d, leg, state, index, stop);
 }
 
-/** 新会话中继续（降级路径与首条即「新会话」的断点续跑共用） */
+/** Continues in a fresh session (shared by the fallback path and resumes whose first task is "new"). */
 async function startWithFresh(
 	d: Required<Pick<EngineDeps, "now" | "sleep" | "bell">> & EngineDeps,
 	leg: BatchLeg,
@@ -177,7 +200,8 @@ async function startWithFresh(
 	stop: StopHandle,
 ): Promise<void> {
 	const res = await leg.ctx.newSession({
-		// 显式会话名（清单 name: 字段行）；未指定则不命名（name 为 undefined 时不传 setup）
+		// Explicit session name (manifest `name:` line); when undefined the
+		// session stays unnamed (no setup is passed for undefined names).
 		name: state.tasks[index]?.name,
 		withSession: async (fresh) => {
 			await runFrom(d, fresh, state, index, stop);
@@ -189,14 +213,19 @@ async function startWithFresh(
 }
 
 // ============================================================================
-// 执行循环（闭包链推进）
+// Execution loop (advancing through the callback chain)
 // ============================================================================
 
 /**
- * 从第 i（0-based）个任务开始执行。
- * 遇到「新会话」任务：newSession（按清单 name: 字段显式命名，未指定则不命名）→ 回调内先执行本条任务再循环推进；
- * 回调返回后旧 leg 就地结束（return，不再推进也不收尾——收尾由最深层的 leg 完成）。
- * 「继续」任务与首条被标记继续的任务：在当前会话直接发送。
+ * Runs tasks starting at `startIndex` (0-based).
+ *
+ * On a "new session" task: newSession (named via the manifest `name:` line when
+ * present, unnamed otherwise) → inside the callback, run this task then loop on;
+ * when the callback returns, the old leg simply ends (return — no advancing and
+ * no finalization; the deepest leg finalizes).
+ *
+ * "Continue" tasks and a first task marked "continue" are sent in the current
+ * session directly.
  */
 async function runFrom(
 	d: Required<Pick<EngineDeps, "now" | "sleep" | "bell">> & EngineDeps,
@@ -207,16 +236,17 @@ async function runFrom(
 ): Promise<void> {
 	let i = startIndex;
 	while (i < state.tasks.length) {
-		if (stop.stopFlag === "gentle") break; // 温和停止：不再推进
+		if (stop.stopFlag === "gentle") break; // Gentle stop: do not advance.
 
 		const record = state.tasks[i]!;
 		if (record.mode === "new") {
 			progress.saveProgress(state);
 			const res = await leg.ctx.newSession({
-				// 显式会话名（清单 name: 字段行）；未指定则不命名
+				// Explicit session name (manifest `name:` line); unnamed when absent.
 				name: record.name,
 				withSession: async (fresh) => {
-					// 本条任务在全新会话中执行；后续任务在同一回调链内循环推进
+					// This task runs in a brand-new session; later tasks keep
+					// advancing inside the same callback chain.
 					const action = await runTask(d, fresh, state, i, stop);
 					if (action === "advance") {
 						await runFrom(d, fresh, state, i + 1, stop);
@@ -228,7 +258,7 @@ async function runFrom(
 			if (res.cancelled) {
 				await finalizeBatch(d, leg, state, stop, "会话切换被取消");
 			}
-			return; // 控制权已移交 fresh 回调
+			return; // Control has moved into the fresh callback.
 		}
 
 		const action = await runTask(d, leg, state, i, stop);
@@ -236,15 +266,16 @@ async function runFrom(
 			i++;
 			continue;
 		}
-		break; // stop / terminate → 收尾
+		break; // stop / terminate → finalize.
 	}
 	await finalizeBatch(d, leg, state, stop);
 }
 
 // ============================================================================
-// 单任务执行：尝试循环 + 重试 + 暂停询问
+// Single task: attempt loop + retries + pause prompt
 // ============================================================================
 
+/** What the caller should do after a task's attempt loop returns. */
 type TaskAction = "advance" | "stop" | "terminate";
 
 async function runTask(
@@ -257,18 +288,20 @@ async function runTask(
 	const record = state.tasks[i]!;
 	let lastStatusAt = 0;
 
-	for (; ;) {
+	for (;;) {
 		if (stop.stopFlag === "gentle") return "stop";
 		debug(`runTask task=${record.index} attempt=${record.attempts} stop=${stop.stopFlag}`);
 
 		if (record.status === "pending") {
-			// 首次开始（含断点续跑重置后的任务）；手动重试不重置计数
+			// First start (including tasks reset by resume); manual retries keep the count.
 			record.status = "running";
 			record.attempts = 0;
 			record.startedAt = d.now();
 			record.endedAt = undefined;
-			// 直接赋值（不用 ?? 兜底）：全新会话首条消息落盘前 getSessionFile() 为 undefined，
-			// 保留旧值会把任务误归到上一任务的会话；undefined 更真实，成功后仍会刷新
+			// Assign directly (no ?? fallback): before a brand-new session's first
+			// message is persisted, getSessionFile() is undefined; keeping the old
+			// value would mis-attribute the task to the previous task's session.
+			// undefined is the honest value; it is refreshed after success anyway.
 			record.sessionFile = leg.ctx.sessionManager.getSessionFile();
 			progress.saveProgress(state);
 		}
@@ -284,8 +317,9 @@ async function runTask(
 			}
 		});
 		debug(`runTask task=${record.index} outcome=${result.outcome}`);
-		// 无论成败都刷新落点会话（失败任务也要在报告中归到正确会话；发送失败等场景
-		// getSessionFile() 可能暂时为 undefined，此时保留原值）
+		// Refresh the landing session regardless of outcome (failed tasks also
+		// need correct session attribution in the report; after send failures
+		// getSessionFile() may be undefined for a while, so keep the old value).
 		record.sessionFile = leg.ctx.sessionManager.getSessionFile() ?? record.sessionFile;
 
 		if (result.outcome === "ok") {
@@ -301,7 +335,8 @@ async function runTask(
 			record.error = "用户中断（Esc）";
 			progress.saveProgress(state);
 			if (stop.stopFlag === "now") {
-				// stop --now：停止意图明确，不再询问，直接终止整批
+				// stop --now: the intent to stop is explicit; terminate the whole
+				// batch without prompting.
 				record.status = "failed";
 				record.endedAt = d.now();
 				record.error = "批次被停止（stop --now）";
@@ -309,10 +344,7 @@ async function runTask(
 				return "terminate";
 			}
 			d.bell();
-			const choice = await leg.ctx.ui.select(
-				`任务 ${record.index} 被手动中断：${record.title}`,
-				["重试本条", "跳过，继续下一条", "终止整批"],
-			);
+			const choice = await leg.ctx.ui.select(`任务 ${record.index} 被手动中断：${record.title}`, ["重试本条", "跳过，继续下一条", "终止整批"]);
 			if (choice === "重试本条") {
 				await d.sleep(RETRY_DELAY_MS);
 				continue;
@@ -329,7 +361,7 @@ async function runTask(
 			return "terminate";
 		}
 
-		// error / send-failed：记录错误并重试
+		// error / send-failed: record the error and retry.
 		record.error = result.error;
 		progress.saveProgress(state);
 
@@ -342,7 +374,7 @@ async function runTask(
 			continue;
 		}
 
-		// 重试耗尽
+		// Retries exhausted.
 		record.status = "failed";
 		record.endedAt = d.now();
 		progress.saveProgress(state);
@@ -350,7 +382,8 @@ async function runTask(
 		if (state.onExhaust === "skip") return "advance";
 		if (state.onExhaust === "abort") return "terminate";
 
-		// pause：弹选择框（无超时，等人；Esc 关闭视为终止）
+		// pause: show a dialog (no timeout — waits for a human; dismissing with
+		// Esc counts as terminate).
 		d.bell();
 		const choice = await leg.ctx.ui.select(
 			`任务 ${record.index} 重试耗尽（已尝试 ${record.attempts} 次）：${record.title}\n${shortError(result.error)}`,
@@ -365,7 +398,7 @@ async function runTask(
 }
 
 // ============================================================================
-// 单次尝试：排队消化 → 订阅 → 发送 → 等待 settled → 判定
+// Single attempt: drain queue → subscribe → send → await settled → judge
 // ============================================================================
 
 async function attemptOnce(
@@ -375,7 +408,8 @@ async function attemptOnce(
 	record: TaskRecord,
 	onTick: () => void,
 ): Promise<AttemptResult> {
-	// (0) 发送前若存在排队消息/未结束的运行：等待消化完（设上限防死等）
+	// (0) If queued messages / an unfinished run exist before sending, wait for
+	// them to drain (bounded so we never wait forever).
 	const drainDeadline = d.now() + PENDING_DRAIN_TIMEOUT_MS;
 	while (leg.ctx.hasPendingMessages()) {
 		await leg.ctx.waitForIdle();
@@ -385,11 +419,11 @@ async function attemptOnce(
 		}
 		await d.sleep(200);
 	}
-	await leg.ctx.waitForIdle(); // 确保空闲后再发
+	await leg.ctx.waitForIdle(); // Make sure the agent is idle before sending.
 
-	// (1) 先订阅，再发送（防竞态：settled 必须在 send 之前挂上）
+	// (1) Subscribe before sending (race safety: settled must be attached first).
 	let settledEvent: { aborted: boolean } | undefined;
-	let resolveSettled: () => void = () => { };
+	let resolveSettled: () => void = () => {};
 	const settledP = new Promise<void>((resolve) => {
 		resolveSettled = resolve;
 	});
@@ -399,9 +433,10 @@ async function attemptOnce(
 		resolveSettled();
 	});
 
-	// (2) 发送提示词（expandPromptTemplates: true，与手工输入行为一致）
-	// 先记录发送前的分支长度：看门狗触发时若分支已推进，说明运行发生过、
-	// 只是 agent_settled 事件未送达（事件桥断裂），与「从未开始运行」区分开
+	// (2) Send the prompt (expandPromptTemplates: true, matching manual input).
+	// Record the branch length before sending: if the watchdog fires and the
+	// branch has advanced, a run did happen but the agent_settled event was
+	// never delivered (broken event bridge) — distinct from "never started".
 	const branchLenBefore = leg.ctx.sessionManager.getBranch().length;
 	let sendPromise: Promise<void> | undefined;
 	try {
@@ -419,29 +454,32 @@ async function attemptOnce(
 	let sendError: unknown;
 	const sendP = sendPromise
 		? sendPromise.then(
-			() => {
-				sendResolved = true;
-			},
-			(e: unknown) => {
-				sendError = e;
-			},
-		)
+				() => {
+					sendResolved = true;
+				},
+				(e: unknown) => {
+					sendError = e;
+				},
+			)
 		: undefined;
 
-	// (3) 等待 settled / 发送失败 / 看门狗
+	// (3) Wait for settled / send failure / watchdog.
 	const startedAt = d.now();
 	const timeoutMs = d.sendFailTimeoutMs ?? 10_000;
-	// void 发送（根会话 pi.sendUserMessage 无返回 Promise）没有 sendP 第二信号，且 pi 的
-	// prompt() 在 _startRun 前有输入处理器与认证探测（网络）两个异步点：慢认证期间
-	// isIdle 恒为真，基础窗口内会误判 send-failed，故对 void 发送追加宽限期（默认合计 60s）
+	// A void send (root-session pi.sendUserMessage without a returned Promise)
+	// has no sendP second signal, and pi's prompt() has two async points before
+	// _startRun (input handler and auth probing over the network): isIdle stays
+	// true during slow auth, which would misjudge send-failure within the base
+	// window, so void sends get an extra grace period (60s total by default).
 	const effectiveTimeoutMs = sendP ? timeoutMs : timeoutMs + (d.sendFailVoidGraceMs ?? 50_000);
 	try {
-		for (; ;) {
+		for (;;) {
 			const racers: Promise<"settled" | "send" | "tick">[] = [
 				settledP.then(() => "settled" as const),
 				d.sleep(500).then(() => "tick" as const),
 			];
-			// sendP 已决后不再入列：避免 send 分支提前 resolve 时形成无退避的紧循环
+			// Do not re-enqueue sendP once settled: avoids a tight loop with no
+			// backoff when the send branch resolves early.
 			if (sendP && !sendResolved && sendError === undefined) racers.push(sendP.then(() => "send" as const));
 			const winner = await Promise.race(racers);
 
@@ -452,22 +490,23 @@ async function attemptOnce(
 				}
 				if (!settledEvent) {
 					debug(`early-send-resolve task=${record.index}`);
-					// 消息被排队/延迟等极端情况：send promise 提前 resolve，但本轮尚未 settle；
-					// 退避后继续等 settled（sendP 已不再入列，后续靠 tick 推进）
+					// Extreme cases (message queued/delayed): the send promise resolved
+					// early but the turn has not settled yet; back off and keep waiting
+					// (sendP is no longer enqueued; ticks drive the loop from here on).
 					await d.sleep(250);
 					continue;
 				}
 				break;
 			}
-			// tick：刷新状态栏 + 发送失败看门狗
+			// tick: refresh the status bar + send-failure watchdog.
 			onTick();
 			if (!settledEvent && d.now() - startedAt > effectiveTimeoutMs && leg.ctx.isIdle() && (!sendP || sendResolved)) {
 				if (leg.ctx.sessionManager.getBranch().length > branchLenBefore) {
-					// 分支已推进：运行发生过，只是 settled 事件未送达（如 /reload 后事件桥断裂）
+					// The branch advanced: a run did happen, only the settled event
+					// never arrived (e.g. a broken event bridge after /reload).
 					return {
 						outcome: "send-failed",
-						error:
-							"运行已结束但未收到 agent_settled 事件（疑似 /reload 或手工切换会话致事件桥断裂，请停止批次后重新启动）",
+						error: "运行已结束但未收到 agent_settled 事件（疑似 /reload 或手工切换会话致事件桥断裂，请停止批次后重新启动）",
 					};
 				}
 				return {
@@ -480,10 +519,11 @@ async function attemptOnce(
 		off();
 	}
 
-	// (4) 双保险：settled 后再 waitForIdle（正常立即返回；期间排队的新消息会自然等到其结束）
+	// (4) Double check: waitForIdle after settled (normally returns immediately;
+	// messages queued meanwhile are waited out naturally).
 	await leg.ctx.waitForIdle();
 
-	// (5) 结果判定
+	// (5) Judge the outcome.
 	if (settledEvent?.aborted) return { outcome: "aborted" };
 	const last = lastAssistantMessage(leg.ctx);
 	if (last && (last.stopReason === "error" || last.stopReason === "aborted")) {
@@ -495,7 +535,7 @@ async function attemptOnce(
 	return { outcome: "ok" };
 }
 
-/** 当前分支上最后一条 assistant 消息（含 stopReason / errorMessage） */
+/** Last assistant message on the current branch (with stopReason / errorMessage). */
 export function lastAssistantMessage(ctx: BatchContext): { stopReason?: string; errorMessage?: string } | undefined {
 	const branch = ctx.sessionManager.getBranch();
 	for (let k = branch.length - 1; k >= 0; k--) {
@@ -508,10 +548,10 @@ export function lastAssistantMessage(ctx: BatchContext): { stopReason?: string; 
 }
 
 // ============================================================================
-// 汇总收尾
+// Finalization
 // ============================================================================
 
-/** 批次收尾：notify + widget + report.md + progress 改名 + 状态清理。幂等。 */
+/** Finalizes a batch: notify + widget + report.md + progress rename + state cleanup. Idempotent. */
 export async function finalizeBatch(
 	d: Required<Pick<EngineDeps, "now" | "sleep" | "bell">> & EngineDeps,
 	leg: BatchLeg,
@@ -524,7 +564,8 @@ export async function finalizeBatch(
 
 	const endedAt = d.now();
 
-	// 防御：不应有停留在 running 的任务（重置回 pending：未真正执行结束，不带 endedAt）
+	// Defensive: no task should remain "running" (reset to pending — it never
+	// really finished, so it gets no endedAt).
 	for (const t of state.tasks) {
 		if (t.status === "running") {
 			t.status = "pending";
@@ -540,8 +581,8 @@ export async function finalizeBatch(
 		d.bell();
 		leg.ctx.ui.notify(line, counts.failed > 0 ? "warning" : "info");
 		leg.ctx.ui.setWidget("batch-summary", report.widgetLines(state, endedAt));
-	} catch (e) {
-		// UI 不可用时尽力保留报告
+	} catch {
+		// Best effort: keep the report even when the UI is unavailable.
 	}
 
 	try {
@@ -556,7 +597,7 @@ export async function finalizeBatch(
 	try {
 		progress.finishProgress(state.listFile);
 	} catch {
-		// 改名失败保留原 progress 文件即可
+		// If the rename fails, keeping the original progress file is fine.
 	}
 	try {
 		leg.ctx.ui.setStatus("batch", undefined);

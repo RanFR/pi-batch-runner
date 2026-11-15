@@ -3,9 +3,11 @@
 	"editor.insertSpaces": false,
 	// --- Language Specific ---
 	"[typescript]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
 		"editor.formatOnSave": true
 	},
 	"[javascript]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
 		"editor.formatOnSave": true
 	},
 	// --- Files ---

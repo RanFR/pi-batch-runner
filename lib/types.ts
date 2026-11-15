@@ -1,33 +1,38 @@
 /**
- * 批处理扩展共享类型。
+ * Shared types for the batch-runner extension.
  *
- * 本模块是纯数据与窄接口定义，不依赖 pi 的类型（lib/ 下所有模块保持零外部依赖，
- * 只用 Node 内置模块），便于单元测试用手写 fake 驱动执行引擎。
- * pi 真实类型仅在 index.ts 入口处做结构适配。
+ * This module holds pure data shapes and narrow interfaces. It does not depend
+ * on pi's types (every module under lib/ stays dependency-free except for Node
+ * built-ins), so unit tests can drive the executor with hand-written fakes.
+ * pi's real types are structurally adapted in the index.ts entry point only.
  */
 
 // ============================================================================
-// 清单解析结果
+// Manifest parsing results
 // ============================================================================
 
-/** 单条任务的会话模式 */
+/** Session mode of a single task. */
 export type TaskMode = "new" | "continue";
 
-/** 清单文件解析出的一条任务 */
+/** One task parsed from a manifest file. */
 export interface BatchTask {
-	/** 1-based 序号（清单中的顺序） */
+	/** 1-based position (order in the manifest). */
 	index: number;
-	/** 会话模式：new = 全新会话；continue = 沿用上一个任务的会话 */
+	/** Session mode: "new" = fresh session; "continue" = reuse the previous task's session. */
 	mode: TaskMode;
-	/** 任务标题（用于状态栏、进度、汇总；会话命名见 name） */
+	/** Task title (status bar, progress, report; session naming, see {@link BatchTask.name}). */
 	title: string;
-	/** 显式会话名（name: 保留字段行，仅对 mode === "new" 的裸标记条目合法；未指定则新会话不命名） */
+	/**
+	 * Explicit session name (from a `name:` reserved-field line). Only valid for
+	 * bare-marker entries with mode === "new"; when undefined the new session is
+	 * left unnamed.
+	 */
 	name?: string;
-	/** 提示词正文（多行，已 trim 首尾） */
+	/** Prompt body (multi-line, trimmed at both ends). */
 	prompt: string;
 }
 
-/** 解析失败 */
+/** Thrown when manifest parsing fails. */
 export class ManifestParseError extends Error {
 	constructor(
 		message: string,
@@ -39,94 +44,108 @@ export class ManifestParseError extends Error {
 }
 
 // ============================================================================
-// 批次状态（内存对象 + progress 文件落盘镜像）
+// Batch state (in-memory object mirrored to the progress file)
 // ============================================================================
 
 export type TaskStatus = "pending" | "running" | "ok" | "failed" | "skipped";
 
-/** 单个任务的执行记录（progress 文件中的镜像；prompt 一并保留，断点续跑自包含） */
+/** Execution record of a single task (mirrored into the progress file; the prompt is kept too so a resume is self-contained). */
 export interface TaskRecord {
 	index: number;
 	mode: TaskMode;
 	title: string;
-	/** 显式会话名（来自清单 name: 字段行；仅「新会话」任务有值，undefined 表示不命名） */
+	/** Explicit session name (from the manifest `name:` line; only "new" tasks have a value, undefined = unnamed). */
 	name?: string;
-	/** 提示词正文（来自清单解析） */
+	/** Prompt body (from manifest parsing). */
 	prompt: string;
 	status: TaskStatus;
-	/** 已尝试次数（含失败重试；成功尝试也计入） */
+	/** Attempts so far (failed retries included; the successful attempt counts too). */
 	attempts: number;
-	/** 最近一次尝试所在会话文件路径 */
+	/** Session file path of the most recent attempt. */
 	sessionFile?: string;
-	/** 最近一次失败的错误摘要 */
+	/** Error summary of the most recent failure. */
 	error?: string;
+	/** Epoch ms when the task first started. */
 	startedAt?: number;
+	/** Epoch ms when the task reached a terminal status. */
 	endedAt?: number;
 }
 
 export type OnExhaust = "pause" | "skip" | "abort";
 
-/** 批次运行状态。progress 文件 schema 即本结构 + schemaVersion。 */
+/** Running state of a batch. The progress-file schema is this shape plus `schemaVersion`. */
 export interface BatchState {
-	/** 清单文件绝对路径 */
+	/** Absolute path of the manifest file. */
 	listFile: string;
-	/** 批次标题（清单文件名去扩展名） */
+	/** Batch title (manifest file name without extension). */
 	batchTitle: string;
 	startedAt: number;
 	updatedAt: number;
 	retries: number;
 	onExhaust: OnExhaust;
+	/** Per-task records, in manifest order. */
 	tasks: TaskRecord[];
 }
 
-/** progress 文件内容 */
+/** Content of the progress file (BatchState plus a schema version). */
 export interface ProgressFile extends BatchState {
 	schemaVersion: 1;
 }
 
-/** progress 文件路径：<清单文件>.progress.json */
+/** Progress file path: `<manifest>.progress.json`. */
 export function progressPathFor(listFile: string): string {
 	return `${listFile}.progress.json`;
 }
 
-/** 汇总报告路径：<清单文件>.report.md */
+/** Report file path: `<manifest>.report.md`. */
 export function reportPathFor(listFile: string): string {
 	return `${listFile}.report.md`;
 }
 
-/** 批次是否已终结（全部任务定案） */
+/** True when the status is final ("ok", "failed", or "skipped"). */
 export function isTerminalStatus(status: TaskStatus): boolean {
 	return status === "ok" || status === "failed" || status === "skipped";
 }
 
 // ============================================================================
-// 执行引擎所需的窄上下文视图
+// Narrow context view required by the executor
 //
-// 真实的 ExtensionCommandContext / ReplacedSessionContext 在 index.ts 中被适配为
-// BatchContext（只暴露引擎用到的方法），单元测试用普通对象实现同一接口。
+// The real ExtensionCommandContext / ReplacedSessionContext is adapted into a
+// BatchContext in index.ts (exposing only the methods the engine uses); unit
+// tests implement the same interface with plain objects.
 // ============================================================================
 
-/** 引擎用到的 UI 操作子集 */
+/** UI operations used by the executor (subset of pi's extension UI). */
 export interface BatchUi {
+	/** Shows a selection dialog; resolves to undefined when dismissed. */
 	select(title: string, options: string[]): Promise<string | undefined>;
+	/** Shows a transient notification. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;
+	/** Sets or clears a status-bar entry. */
 	setStatus(key: string, text: string | undefined): void;
+	/** Sets or clears a persistent widget above the editor. */
 	setWidget(key: string, content: string[] | undefined): void;
 }
 
-/** 会话分支条目的窄视图（只读，用于结果判定） */
+/** Narrow read-only view of a session branch entry (used to judge outcomes). */
 export interface BranchEntryView {
+	/** Entry type (e.g. "message"). */
 	type: string;
+	/** Message fields inspected by the executor, when the entry is a message. */
 	message?: {
+		/** Message role (e.g. "assistant"). */
 		role: string;
+		/** Stop reason of the last model turn ("error"/"aborted" indicate failure). */
 		stopReason?: string;
+		/** Error detail when the turn failed. */
 		errorMessage?: string;
 	};
 }
 
 /**
- * 引擎眼中的会话上下文（对应 ExtensionCommandContext / ReplacedSessionContext）。
- * 「新会话」边界后，withSession 回调拿到的新上下文同样适配为本接口。
+ * Session context as the engine sees it (mirrors ExtensionCommandContext /
+ * ReplacedSessionContext). After a "new session" boundary, the fresh context
+ * handed to the withSession callback is adapted to this same interface.
  */
 export interface BatchContext {
 	isIdle(): boolean;
@@ -139,76 +158,85 @@ export interface BatchContext {
 	};
 	readonly ui: BatchUi;
 	/**
-	 * 会话切换回调收到完整的 BatchLeg（新上下文 + 对应的发送函数）。
-	 * 引擎在回调内使用 fresh leg 推进后续任务；旧 leg 同时失效。
-	 * name：新会话的显示名（经 newSession 的 setup 直接写入 sessionManager，
-	 * 避免使用替换后已失效的旧 pi 门面）。
+	 * Session-switch callbacks receive a full BatchLeg (fresh context plus its
+	 * send function). The engine drives subsequent tasks inside the callback;
+	 * the old leg becomes stale at the same time.
+	 *
+	 * `name` names the new session (written straight into the sessionManager via
+	 * newSession's `setup`, avoiding the stale pi facade after replacement).
 	 */
-	newSession(options: {
-		name?: string;
-		withSession: (freshLeg: BatchLeg) => Promise<void>;
-	}): Promise<{ cancelled: boolean }>;
-	switchSession(
-		sessionPath: string,
-		options: { withSession: (freshLeg: BatchLeg) => Promise<void> },
-	): Promise<{ cancelled: boolean }>;
+	newSession(options: { name?: string; withSession: (freshLeg: BatchLeg) => Promise<void> }): Promise<{ cancelled: boolean }>;
+	switchSession(sessionPath: string, options: { withSession: (freshLeg: BatchLeg) => Promise<void> }): Promise<{ cancelled: boolean }>;
 }
 
 /**
- * 发送提示词的函数。
- * - 首条 leg 用 pi.sendUserMessage（返回 void，错误被 pi 运行时吞掉并上报）；
- * - 会话切换后用 ReplacedSessionContext.sendUserMessage（返回 Promise，run 结束才 resolve）。
- * 引擎对两种返回都兼容：返回 Promise 时把它作为额外的完成信号。
+ * Sends a prompt.
+ * - The first leg uses pi.sendUserMessage (returns void; errors are swallowed
+ *   and reported by pi's runtime);
+ * - After a session switch, ReplacedSessionContext.sendUserMessage returns a
+ *   Promise that resolves only when the run has finished.
+ * The engine accepts both: a returned Promise serves as an extra completion
+ * signal.
  */
 export interface BatchSend {
 	(content: string, options?: { expandPromptTemplates?: boolean }): void | Promise<void>;
 }
 
-/** 一条执行腿：一个活跃会话上下文 + 对应的发送函数 */
+/** One execution leg: an active session context plus its send function. */
 export interface BatchLeg {
 	ctx: BatchContext;
 	send: BatchSend;
 }
 
 // ============================================================================
-// 执行引擎依赖（可注入，便于测试）
+// Executor dependencies (injectable for testing)
 // ============================================================================
 
-/** agent_settled 事件源（index.ts 在 factory 期一次性订阅并桥接到闭包监听槽位；
- *  运行期 subscribe/unsubscribe 不触碰 pi 门面，避免会话替换后的 stale 错误） */
+/**
+ * agent_settled event source (index.ts subscribes once during the factory phase
+ * and bridges it to a module-level listener slot; subscribe/unsubscribe at run
+ * time never touch the pi facade, avoiding stale errors after session
+ * replacements).
+ */
 export interface SettledBus {
+	/** Registers a listener; returns its unsubscribe function. The event carries `aborted` (true when the user aborted). */
 	subscribe(cb: (event: { aborted: boolean }) => void): () => void;
 }
 
-/** 引擎可注入依赖 */
+/** Dependencies injectable into the executor. */
 export interface EngineDeps {
-	/** settled 事件源（先订阅后发送的关键） */
+	/** Settled-event source (subscribing before sending is essential). */
 	settled: SettledBus;
-	/** 时钟（毫秒），默认 Date.now */
+	/** Clock in milliseconds; defaults to Date.now. */
 	now?: () => number;
-	/** 睡眠，默认 setTimeout；测试可注入即时 resolve */
+	/** Sleep; defaults to setTimeout. Tests can inject an instantly-resolved version. */
 	sleep?: (ms: number) => Promise<void>;
-	/** 发送失败判定窗口（毫秒），默认 10_000；测试可调小 */
+	/** Send-failure watchdog window in milliseconds; defaults to 10_000. Tests can shrink it. */
 	sendFailTimeoutMs?: number;
-	/** void 发送（根会话 pi.sendUserMessage 无返回 Promise，缺失第二完成信号）的
-	 *  看门狗加时窗口（毫秒），默认 50_000。pi 的 prompt() 在 _startRun 前有输入处理器
-	 *  与认证探测（网络）两个异步点，弱网/慢认证超过基础窗口时应放宽判定，避免误判。 */
+	/**
+	 * Extra watchdog grace for void sends in milliseconds; defaults to 50_000.
+	 * A void send (root-session pi.sendUserMessage without a returned Promise)
+	 * lacks the second completion signal, and pi's prompt() has two async points
+	 * before _startRun (input handler and auth probing over the network): isIdle
+	 * stays true during slow auth, so a longer window avoids misjudging
+	 * send-failure.
+	 */
 	sendFailVoidGraceMs?: number;
-	/** 终端响铃，默认 process.stdout.write("\x07") */
+	/** Terminal bell; defaults to process.stdout.write("\x07"). */
 	bell?: () => void;
-	/** 批次终结后的回调（index.ts 用来清理 activeBatch） */
+	/** Callback after the batch is finalized (index.ts clears activeBatch). */
 	onBatchEnd?: () => void;
 }
 
 // ============================================================================
-// 命令配置
+// Command configuration
 // ============================================================================
 
-/** /batch 启动配置（命令行参数解析结果 + 默认值） */
+/** /batch launch configuration (parsed command-line options plus defaults). */
 export interface RunConfig {
 	retries: number;
 	onExhaust: OnExhaust;
-	/** 1-based 起始任务号（--start） */
+	/** 1-based first task to run (--start). */
 	startAt: number;
 	dryRun: boolean;
 }

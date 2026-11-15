@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
-# pi-batch-runner 离线分发打包脚本。
+# pi-batch-runner offline-distribution packing script.
 #
-# 把「保证插件在离线电脑上成功运行」的最小内容集（白名单）打成
-# dist/pi-batch-runner-<version>.tar.gz（附 sha256），包内附带双平台安装脚本：
-#   - Linux/macOS: install.sh（默认 symlink，--copy 复制，--force 覆盖）
-#   - Windows:     install.ps1（默认 Junction，-Copy / -Force / -Target <dir>）
+# Packs the minimal whitelist needed to run the extension on an offline machine
+# into dist/pi-batch-runner-<version>.tar.gz (with a sha256 checksum). The
+# bundle ships installers for both platforms:
+#   - Linux/macOS: install.sh (symlink by default; --copy to copy, --force to overwrite)
+#   - Windows:     install.ps1 (Junction by default; -Copy / -Force / -Target <dir>)
+# CHANGELOG.md is included so pi 1.5.0+ shows an update digest on next launch.
 #
-# 用法：bash scripts/pack.sh   （或 npm run pack；可从任意 cwd 运行）
-# 运行时零外部依赖：本扩展只依赖 node: 内置模块，目标机无需 npm install。
+# Usage: bash scripts/pack.sh   (or npm run pack; runs from any cwd)
+# Zero runtime dependencies: the extension only imports node: built-ins, so the
+# target machine needs no npm install.
 set -euo pipefail
 
-# ---- 定位仓库根（支持从任意 cwd 运行）----
+# ---- Locate the repo root (runs from any cwd) ----
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 NAME="pi-batch-runner"
 STAGE="dist/stage"
 PKG_DIR="$STAGE/$NAME"
 
-# ---- 依赖检查 ----
+# ---- Dependency check ----
 for cmd in tar sha256sum node; do
 	command -v "$cmd" >/dev/null 2>&1 || {
 		echo "错误: 打包机缺少命令 $cmd" >&2
@@ -25,14 +28,14 @@ for cmd in tar sha256sum node; do
 	}
 done
 
-# ---- 读取版本并准备暂存区 ----
+# ---- Read the version and prepare the staging area ----
 VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")"
 TARBALL="dist/${NAME}-${VERSION}.tar.gz"
 
 rm -rf "$STAGE"
 mkdir -p "$PKG_DIR/lib" "$PKG_DIR/examples"
 
-# ---- 白名单复制 + 完整性校验 ----
+# ---- Whitelist copy + integrity checks ----
 copy() {
 	local src="$1" dst="$2"
 	if [ ! -s "$src" ]; then
@@ -44,6 +47,7 @@ copy() {
 
 copy index.ts "$PKG_DIR/index.ts"
 copy package.json "$PKG_DIR/package.json"
+copy CHANGELOG.md "$PKG_DIR/CHANGELOG.md"
 copy README.md "$PKG_DIR/README.md"
 copy examples/tasks.example.md "$PKG_DIR/examples/tasks.example.md"
 for f in lib/*.ts; do
@@ -56,14 +60,14 @@ if [ "$LIB_COUNT" -ne 5 ]; then
 	exit 1
 fi
 
-# ---- import 纯净性检查（防止未来引入运行时外部依赖而打包遗漏）----
+# ---- Import purity check (guards against future runtime deps missing from the bundle) ----
 if grep -rn 'from "@' index.ts lib/*.ts | grep -v 'import type' >/dev/null; then
 	echo "错误: 源码出现运行时外部依赖（打包策略只覆盖 node: 内置模块），请先处理：" >&2
 	grep -rn 'from "@' index.ts lib/*.ts | grep -v 'import type' >&2 || true
 	exit 1
 fi
 
-# ---- best-effort typecheck 门 ----
+# ---- Best-effort typecheck gate ----
 if [ -d node_modules ]; then
 	echo "==> 运行 typecheck"
 	npm run typecheck
@@ -71,7 +75,7 @@ else
 	echo "警告: 未找到 node_modules，跳过 typecheck（质量门未执行）" >&2
 fi
 
-# ---- 生成包内 install.sh（Linux/macOS）----
+# ---- Generate the bundled install.sh (Linux/macOS) ----
 cat >"$PKG_DIR/install.sh" <<'INSTALL_SH_EOF'
 #!/usr/bin/env bash
 # pi-batch-runner 安装脚本（Linux/macOS）
@@ -118,8 +122,9 @@ echo "重启 pi 后 /batch 命令可用。"
 INSTALL_SH_EOF
 chmod +x "$PKG_DIR/install.sh"
 
-# ---- 生成包内 install.ps1（Windows PowerShell 5.1+）----
-# 注：先写入临时文件再加 UTF-8 BOM —— PS 5.1 对无 BOM 文件按 ANSI 解析，中文会乱码。
+# ---- Generate the bundled install.ps1 (Windows PowerShell 5.1+) ----
+# Note: write a temp file first, then prepend a UTF-8 BOM — PS 5.1 parses BOM-less
+# files as ANSI, which would garble the Chinese text.
 PS1_TMP="$PKG_DIR/.install.ps1.tmp"
 cat >"$PS1_TMP" <<'INSTALL_PS1_EOF'
 # pi-batch-runner 安装脚本（Windows PowerShell 5.1+）
@@ -165,7 +170,7 @@ INSTALL_PS1_EOF
 printf '\xEF\xBB\xBF' | cat - "$PS1_TMP" > "$PKG_DIR/install.ps1"
 rm -f "$PS1_TMP"
 
-# ---- 打 tar 包与校验和 ----
+# ---- Build the tarball and checksum ----
 mkdir -p dist
 rm -f "$TARBALL" "${TARBALL}.sha256"
 tar -czf "$TARBALL" -C "$STAGE" "$NAME"
@@ -174,7 +179,7 @@ tar -czf "$TARBALL" -C "$STAGE" "$NAME"
 	sha256sum "$(basename "$TARBALL")" >"$(basename "$TARBALL").sha256"
 )
 
-# ---- 摘要 ----
+# ---- Summary ----
 FILE_COUNT="$(tar -tzf "$TARBALL" | grep -vc '/$')"
 echo ""
 echo "==> 打包完成"

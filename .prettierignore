@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+
+# Lockfiles are machine-managed
+package-lock.json
+
+# Docs are prose, not code
+*.md

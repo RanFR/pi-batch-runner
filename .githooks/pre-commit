@@ -1,10 +1,15 @@
 #!/bin/sh
-# Pre-commit formatting check, mirrors vscode's "precommit" hygiene step:
-# only staged *.ts files are verified against the TypeScript formatter
-# (defaults + tsfmt.json). Bypass with `git commit --no-verify`.
+# Pre-commit hygiene: lint + format-check the staged files.
+# Bypass with `git commit --no-verify`.
 
-staged=$(git diff --cached --name-only --diff-filter=ACMR -- '*.ts')
-[ -z "$staged" ] && exit 0
+staged_ts=$(git diff --cached --name-only --diff-filter=ACMR -- '*.ts' '*.js')
+[ -z "$staged_ts" ] && exit 0
 
-echo "Running formatting check on staged files..."
-node scripts/verify-formatting.ts --verify $staged
+echo "Running ESLint on staged files..."
+npx eslint --no-warn-ignored $staged_ts || exit 1
+
+echo "Running Prettier check on staged files..."
+npx prettier --check $staged_ts || {
+	echo "Files not formatted. Run 'npm run format' and re-stage."
+	exit 1
+}
