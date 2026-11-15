@@ -11,6 +11,11 @@
 		"tui",
 		"prompts"
 	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
 	"author": {
 		"name": "RanFR",
 		"url": "https://github.com/RanFR"
@@ -26,6 +31,9 @@
 		"format:check": "prettier --check .",
 		"format": "prettier --write .",
 		"pack": "bash scripts/pack.sh"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
 	},
 	"devDependencies": {
 		"@earendil-works/pi-coding-agent": "1.5.2",
